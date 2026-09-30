@@ -54,16 +54,16 @@ set_target_properties(rime-llm-objs PROPERTIES
   POSITION_INDEPENDENT_CODE ON)
 target_compile_options(rime-llm-objs PRIVATE -O2)
 
-add_library(llama_ext STATIC IMPORTED)
+add_library(llama_ext STATIC IMPORTED GLOBAL)
 set_target_properties(llama_ext PROPERTIES
   IMPORTED_LOCATION "${LLAMA_ROOT}/build/src/libllama.a")
-add_library(ggml_ext STATIC IMPORTED)
+add_library(ggml_ext STATIC IMPORTED GLOBAL)
 set_target_properties(ggml_ext PROPERTIES
   IMPORTED_LOCATION "${LLAMA_ROOT}/build/ggml/src/libggml.a")
-add_library(ggml_base_ext STATIC IMPORTED)
+add_library(ggml_base_ext STATIC IMPORTED GLOBAL)
 set_target_properties(ggml_base_ext PROPERTIES
   IMPORTED_LOCATION "${LLAMA_ROOT}/build/ggml/src/libggml-base.a")
-add_library(ggml_cpu_ext STATIC IMPORTED)
+add_library(ggml_cpu_ext STATIC IMPORTED GLOBAL)
 set_target_properties(ggml_cpu_ext PROPERTIES
   IMPORTED_LOCATION "${LLAMA_ROOT}/build/ggml/src/libggml-cpu.a")
 
