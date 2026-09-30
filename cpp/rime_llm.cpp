@@ -854,7 +854,12 @@ static void load_model_async() {
         llama_backend_init();
 
         llama_model_params mparams = llama_model_default_params();
+#ifdef _WIN32
         mparams.use_mmap = 1;
+#else
+        // 2026-10 llama.cpp 已以 load_mode 取代 use_mmap 布尔
+        mparams.load_mode = LLAMA_LOAD_MODE_MMAP;
+#endif
 
         g_model = llama_model_load_from_file(g_model_path.c_str(), mparams);
         if (!g_model) {
@@ -872,7 +877,12 @@ static void load_model_async() {
         cparams.n_threads_batch = n_thr;
         cparams.n_seq_max       = g_n_seq_max;
 
+#ifdef _WIN32
         g_ctx = llama_new_context_with_model(g_model, cparams);
+#else
+        // 2026-10 llama.cpp 更名 llama_init_from_model
+        g_ctx = llama_init_from_model(g_model, cparams);
+#endif
         if (!g_ctx) {
             log_msg("ERROR: failed to create context");
             llama_model_free(g_model);
