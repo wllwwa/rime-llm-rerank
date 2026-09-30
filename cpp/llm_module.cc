@@ -5,7 +5,13 @@
 // require/loadlib 加载，不经 librime 模块机制（Windows 构建不走本文件）。
 #include <rime_api.h>
 
+// 定义在 rime_llm.cpp：停掉预习 worker 并 join。
+// finalize 是唯一能覆盖「fcitx5 退出」与「lucky_bench 退出」的公共时机——worker
+// 若正持锁解码而进程在此刻收尾，就是 use-after-free。原实现每次 prepare 起一个
+// detached 线程、无人回收，离线基准的退出阶段实测偶发 core dump。
+void rime_llm_shutdown();
+
 static void rime_llm_initialize() {}
-static void rime_llm_finalize() {}
+static void rime_llm_finalize() { rime_llm_shutdown(); }
 
 RIME_REGISTER_MODULE(llm)

@@ -109,7 +109,28 @@ static std::atomic<int>         g_prep_seq{0};  // 请求序列号，跳过过�
 static long                      g_seq0_gen = 0; // seq0 KV 代次: 任何覆盖 seq0 的 decode 递增
 static long                      g_prep_gen = 0; // prepare 完成时的代次
 
-static int g_score_log_cnt = 0;  // score 日志限频计数器
+// ---- 预习请求调度（2026-10-01 重做）----------------------------------------
+// 原实现：每次 prepare 起一个 detached 线程，抢不到 g_mutex 就**直接丢弃**该请求
+// （log "SKIP score in progress"）。实测下来被丢弃的那个 ctx 恰恰是紧接着 score
+// 需要的：真人日志里 SKIP 占预习请求的 15%，被丢弃后 score 只能自己同步解码
+// （S1=70~90ms）。离线基准用 burst 语料复现得更极端：丢弃率 66%、87% 的评分走
+// 同步 S1。
+// 现实现：**单个常驻 worker + 只保留最新请求的槽 + 代次校验**，worker 抢不到锁
+// 就退避重试而不是丢弃（旧请求被新请求取代才算作废，这是正确语义）。
+// 另外给 score 让路：worker 在"即将开始一次长 decode"前检查有无 score 在等锁/
+// 持锁，有就让路——score 是人等着的路径，预习只是投机，绝不能让新调度器给
+// score 加延迟（这是必须守住的约束）。
+static std::mutex               g_prep_mu;        // 保护待预习槽
+static std::condition_variable  g_prep_cv;
+static std::vector<llama_token> g_pending_ctx;    // 最新待预习 ctx（覆盖式）
+static std::atomic<int>         g_pending_seq{0}; // 槽内 ctx 对应的请求号
+static bool                      g_pending_valid = false;
+static std::atomic<bool>        g_prep_stop{false};
+static std::atomic<bool>        g_prep_worker_started{false};
+static std::thread               g_prep_worker_thread;  // 供退出时 join
+static std::atomic<int>         g_score_waiting{0}; // 正在等锁的 score 数
+static std::atomic<int>         g_score_active{0};  // 持锁执行的 score 数
+static std::atomic<int>         g_prep_superseded{0}; // 被更新取代的请求数（诊断）
 
 // ============================================================
 // 轻量日志
@@ -1025,6 +1046,15 @@ static double ce_target(float * logits, int target_id, float m, double lse) {
 //       多 token 候选每个 seq 仅 1 个新 token，SSM 跨序列干扰可忽略
 //       ith = batch 数组索引（不是 logits 标记序号）
 // ============================================================
+// score 持锁标记：清零后 prep worker 才能重新开跑。带显式 clear() 是因为日志要
+// 挪到放锁之后（见函数尾），不能只靠析构。
+struct ScoreActiveGuard {
+    ScoreActiveGuard()  { g_score_active.fetch_add(1); }
+    void clear() { if (active_) { g_score_active.fetch_sub(1); active_ = false; } }
+    ~ScoreActiveGuard() { clear(); }
+    bool active_ = true;
+};
+
 static void score_batch(const std::vector<llama_token> & ctx_ids,
                          const std::vector<std::vector<llama_token>> & cands,
                          std::vector<double> & scores_out) {
@@ -1032,14 +1062,24 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     int n_cands = (int)cands.size();
     if (n_cands == 0) return;
 
-    auto t0 = std::chrono::high_resolution_clock::now();
-    std::lock_guard<std::mutex> lock(g_mutex);
-    auto t1 = std::chrono::high_resolution_clock::now();
-    double wait_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-
-
+    // 这几个量放锁之后还要打日志，所以在锁外声明（锁内只赋值）
     int ctx_len = (int)ctx_ids.size();
+    double wait_ms = 0, ms1 = 0, ms_ce1 = 0, ms2a = 0, ms2b = 0, ms3 = 0;
+    double ms_score = 0, total_ms = 0;
+    const char * prep_miss = "none";   // prep 未命中原因，命中时打印 "-"
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    // 让 prep worker 严格让路：先置 waiting → 拿锁 → 置 active；两者都清零后
+    // worker 才会开启新的长 decode。顺序不能反，否则 worker 能插到中间抢锁。
+    g_score_waiting.fetch_add(1);
+    std::unique_lock<std::mutex> lock(g_mutex);
+    g_score_waiting.fetch_sub(1);
+    ScoreActiveGuard score_active;
+    auto t1 = std::chrono::high_resolution_clock::now();
+    wait_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
     int vs = llama_n_vocab(g_vocab);
+
 
     // 按 token 数分组
     std::vector<int> idx2, idx3;
@@ -1054,8 +1094,16 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     // 检测预解码状态：ctx 完全匹配 且 seq0 未被其他 decode 覆盖 → 跳过 Step 1
     // 代次匹配防止: 完整流程 score 覆盖 seq0 后, 旧 prep 状态被误用 (KV 与 logits 不一致)
     bool use_prep = g_prep_ready && ctx_ids == g_prep_ctx && g_seq0_gen == g_prep_gen;
+    if (!use_prep) {
+        // prep=0 原先完全不可解释，这里给出原因：none=压根没有预解码结果
+        //（请求被丢弃/还没来得及跑）；ctx=有结果但 ctx 不同；gen=ctx 相同但
+        // seq0 已被别的 decode 覆盖（代次失配）
+        if (!g_prep_ready)              prep_miss = "none";
+        else if (ctx_ids != g_prep_ctx) prep_miss = "ctx";
+        else                            prep_miss = "gen";
+    }
     std::vector<float> ctx_logits;
-    double ms1 = 0;
+    ms1 = 0;
 
     if (!use_prep) {
         // ---- 完整流程：Step 1 ctx decode ----
@@ -1103,11 +1151,11 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
         ce_sum[i] = kCeW1 * ce_target(ctx_logits.data(), cands[i][0], m0, lse0);
     }
     auto ts_ce1_1 = std::chrono::high_resolution_clock::now();
-    double ms_ce1 =
+    ms_ce1 =
         std::chrono::duration<double, std::milli>(ts_ce1_1 - ts_ce1_0).count();
 
     // ---- Step 2: 多 token 候选的首 token 并行 decode（每 seq 1 token）----
-    double ms2a = 0, ms2b = 0;
+    ms2a = 0; ms2b = 0;
     if (M > 0) {
         auto ts2_0 = std::chrono::high_resolution_clock::now();
         // KV copy ctx (seq 0) → worker seqs 1..M
@@ -1148,7 +1196,7 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     }
 
     // ---- Step 3: 3-token 候选的次 token 并行 decode ----
-    double ms3 = 0;
+    ms3 = 0;
     if (K > 0) {
         auto ts3_0 = std::chrono::high_resolution_clock::now();
         llama_batch b3 = llama_batch_init(K, 0, K);
@@ -1205,41 +1253,36 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     // (代次机制保证 seq0 被覆盖后自动失效, 无需主动清除)
 
     auto t_end = std::chrono::high_resolution_clock::now();
-    double total_ms = std::chrono::duration<double, std::milli>(t_end - t0).count();
-    double ms_score =
+    total_ms = std::chrono::duration<double, std::milli>(t_end - t0).count();
+    ms_score =
         std::chrono::duration<double, std::milli>(t_end - ts_sc_0).count();
-    // 日志限频: 每 10 次记一次, 慢请求 (总耗时 > 100ms) 始终记录
+
+    // 放锁之后再打日志：log_msg 每次都 fopen/fprintf/fclose，留在锁里会把这段
+    // 耗时算进别人看到的 wait —— 而 wait 正是本项目要测的量。
+    lock.unlock();
+    score_active.clear();
+
     // 计时: wait=锁等待 S1=ctx decode(0 on prep) CE1=P(cand0|ctx)
     //       KV=KV copy S2=decode cand0 S3=decode cand1 score=加权求和
-    if (++g_score_log_cnt % 10 == 1 || total_ms > 100)
-        log_msg("score: wait=%.0fms S1=%.0fms CE1=%.0fms KV=%.0fms S2=%.0fms "
-                "S3=%.0fms score=%.0fms total=%.0fms prep=%d ctx_tok=%d cand=%d",
-                wait_ms, ms1, ms_ce1, ms2a, ms2b, ms3, ms_score, total_ms,
-                use_prep ? 1 : 0, ctx_len, n_cands);
+    // 不再限频（原为"每 10 次记一次 + 总耗时 >100ms 必记"）：那样样本天然偏向
+    // 慢请求，占比无法当全量口径。体量可忽略——真人实测约 0.8 次评分/秒。
+    log_msg("score: wait=%.0fms S1=%.0fms CE1=%.0fms KV=%.0fms S2=%.0fms "
+            "S3=%.0fms score=%.0fms total=%.0fms prep=%d ctx_tok=%d cand=%d "
+            "prep_miss=%s",
+            wait_ms, ms1, ms_ce1, ms2a, ms2b, ms3, ms_score, total_ms,
+            use_prep ? 1 : 0, ctx_len, n_cands,
+            use_prep ? "-" : prep_miss);
 }
 
 // ============================================================
-// 预解码：在 commit 后异步执行 Step 1 + KV copy
-// seq 用于跳过过期请求（新的 prepare 已到达，旧的直接放弃）
+// 预解码：在 commit 后异步执行 Step 1（ctx decode）
+// 调度方式见 g_pending_* 那组全局的注释：单常驻 worker + 最新请求槽 + 代次校验
 // ============================================================
-static void prepare(const std::vector<llama_token> & ctx_ids, int seq) {
-    // 推理进行中（score 持锁）则放弃本轮（2026-09-04，与源码版同步）：
-    // prep 只是预解码优化，下次 score 的全流程会自我刷新兜底；阻塞等锁
-    // 会让 detached prepare 线程在 g_mutex 上与 score 争用、堆积排队
-    std::unique_lock<std::mutex> lock(g_mutex, std::try_to_lock);
-    if (!lock.owns_lock()) {
-        log_msg("prepare: SKIP score in progress (seq=%d ctx_tok=%d)",
-                seq, (int)ctx_ids.size());
-        return;
-    }
 
+// 持锁执行：ctx decode + 发布 prep 状态。调用方必须已持有 g_mutex，且校验过
+// g_ctx/g_vocab 非空与代次有效。
+static void prep_decode_locked(const std::vector<llama_token> & ctx_ids, int seq) {
     int ctx_len = (int)ctx_ids.size();
-
-    // 过期请求：新的 prepare 已到来，放弃本次计算
-    if (seq != g_prep_seq.load()) {
-        log_msg("prepare: SKIP stale seq=%d current=%d ctx_tok=%d", seq, g_prep_seq.load(), ctx_len);
-        return;
-    }
     auto tp0 = std::chrono::high_resolution_clock::now();
     log_msg("prepare: start ctx_tok=%d seq=%d", ctx_len, seq);
     int vs = llama_n_vocab(g_vocab);
@@ -1282,6 +1325,77 @@ static void prepare(const std::vector<llama_token> & ctx_ids, int seq) {
     log_msg("prepare: done ctx_tok=%d seq=%d took=%.0fms", ctx_len, seq, took_ms);
 }
 
+// 取走最新请求；收到停止信号返回 false。
+static bool prep_take(std::vector<llama_token> & out, int & seq) {
+    std::unique_lock<std::mutex> lk(g_prep_mu);
+    g_prep_cv.wait(lk, [] { return g_pending_valid || g_prep_stop.load(); });
+    if (g_prep_stop.load()) return false;
+    out = g_pending_ctx;
+    seq = g_pending_seq.load();
+    g_pending_valid = false;
+    return true;
+}
+
+// 常驻 worker：取最新请求 → 抢锁（抢不到就退避重试，**不丢弃**）→ 解码发布。
+static void prep_worker() {
+    for (;;) {
+        std::vector<llama_token> ctx;
+        int seq = 0;
+        if (!prep_take(ctx, seq)) return;
+        for (;;) {
+            if (g_prep_stop.load()) return;
+            // 已被更新的请求取代：这是唯一合法的"作废"（旧 ctx 已无人需要）
+            if (seq != g_prep_seq.load()) {
+                g_prep_superseded.fetch_add(1);
+                log_msg("prepare: superseded seq=%d ctx_tok=%d (latest=%d)",
+                        seq, (int)ctx.size(), g_prep_seq.load());
+                break;
+            }
+            // 给 score 让路：有人等锁或持锁时不开启新的长 decode。
+            // 这是硬约束——改造后不得给 score 增加任何等待。
+            if (g_score_waiting.load() || g_score_active.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            std::unique_lock<std::mutex> lock(g_mutex, std::try_to_lock);
+            if (!lock.owns_lock()) {
+                // 原实现在这里直接丢弃请求（log "SKIP score in progress"），
+                // 被丢的那个 ctx 紧接着就被 score 需要 → 只能同步解码 70~90ms。
+                // 改成退避重试：请求只会因"被更新取代"而作废，不会因抢不到锁而丢失。
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            if (seq != g_prep_seq.load()) {
+                g_prep_superseded.fetch_add(1);
+                log_msg("prepare: superseded seq=%d ctx_tok=%d (latest=%d)",
+                        seq, (int)ctx.size(), g_prep_seq.load());
+                break;
+            }
+            if (g_score_waiting.load()) continue;  // 让出锁，交给 score 先走
+            if (!g_ctx || !g_vocab) break;         // 模型已被卸载
+            prep_decode_locked(ctx, seq);
+            break;
+        }
+    }
+}
+
+static void ensure_prep_worker() {
+    bool expected = false;
+    if (g_prep_worker_started.compare_exchange_strong(expected, true)) {
+        g_prep_worker_thread = std::thread(prep_worker);
+    }
+}
+
+// 由 llm_module.cc 的 finalize 调用：停 worker 并等它退出。
+// 为什么需要它：worker 可能正持着 g_mutex 在解码，此时进程退出 / 模型析构就是
+// use-after-free —— 原实现"每次 prepare 起一个 detached 线程"在离线基准的退出
+// 阶段偶发 core dump，正是这一类竞争。
+void rime_llm_shutdown() {
+    g_prep_stop.store(true);
+    g_prep_cv.notify_all();
+    if (g_prep_worker_thread.joinable()) g_prep_worker_thread.join();
+}
+
 // ============================================================
 // Lua API
 // ============================================================
@@ -1303,13 +1417,30 @@ static int lua_prepare(lua_State * L) {
         return 1;
     }
 
-    // 递增序列号，之前的过期 prepare 会在获取 mutex 后自行跳过
+    // 只登记"最新请求"（覆盖式）：旧请求被新请求取代即作废，worker 取走的
+    // 一定是此刻最新的那一个。这里不起线程——原实现每次 new 一个 detached
+    // 线程，既贵（每键一次线程创建）又会堆在 g_mutex 上互相争用。
     int seq = ++g_prep_seq;
-
-    // 异步执行预解码，不阻塞输入法 processor
-    std::thread([ctx_ids, seq]() {
-        prepare(ctx_ids, seq);
-    }).detach();
+    int over_seq = 0, over_tok = 0;   // 被这次覆盖掉的旧请求（用于日志，见下）
+    {
+        std::lock_guard<std::mutex> lk(g_prep_mu);
+        if (g_pending_valid) {
+            over_seq = g_pending_seq.load();
+            over_tok = (int)g_pending_ctx.size();
+            g_prep_superseded.fetch_add(1);
+        }
+        g_pending_ctx = ctx_ids;
+        g_pending_seq.store(seq);
+        g_pending_valid = true;
+    }
+    // 日志放在锁外（log_msg 要开关文件）。为什么必须记：worker 还没取走就被
+    // 覆盖的请求不会有 start/done 行，不记的话统计上会少算请求数，改前改后
+    // 的"丢弃率"就不可比了（原实现是逐条 SKIP，条数完整）。
+    if (over_seq)
+        log_msg("prepare: superseded seq=%d ctx_tok=%d (未开始即被更新取代)",
+                over_seq, over_tok);
+    ensure_prep_worker();
+    g_prep_cv.notify_one();
 
     lua_pushboolean(L, 1);
     return 1;
