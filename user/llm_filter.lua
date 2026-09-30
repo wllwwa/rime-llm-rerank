@@ -41,6 +41,28 @@ local function is_valid_llm_score(v)
     return is_finite_number(v) and v > -1e9
 end
 
+-- 期望词长（pdbj 码制：每字 3 码，第 3 码为形码 Z；2026-10-01 按用户口述码制修正）
+--   2-3 码 → 1 字（单字）
+--   6 码   → 按后三码里 Z 的位置区分两种语义：
+--             第 6 位是 Z（.....Z）        → 正常二字词，期望 2 字
+--             第 4 或 5 位是 Z（...Z.. / ....Z.）→ 单字+补充码，期望 1 字
+--             其余形态（异常输入）        → 不加成
+--   ≥9 码  → 3 字及以上（“二字以上恒为 9 码”，含 4/5 字词）
+-- 返回：期望词长, 是否"及以上"；无法判定时返回 nil（不加成，fail-safe）
+local function expected_word_len(code)
+    local n = #code
+    if n <= 3 then
+        return 1, false
+    elseif n == 6 then
+        if code:sub(6, 6) == "Z" then return 2, false end
+        if code:sub(4, 4) == "Z" or code:sub(5, 5) == "Z" then return 1, false end
+        return nil, false
+    elseif n >= 9 then
+        return 3, true
+    end
+    return nil, false  -- 4/5/7/8 码等非常规形态：不加成
+end
+
 local function get_config_number(sc, key)
     local ok, v = pcall(function() return sc:get_double(key) end)
     if ok and is_finite_number(v) then return v end
@@ -335,9 +357,13 @@ return function(translation, env)
             end)
             for i = 1, #arr do ordered[i] = arr[i].c end
         end
-        -- 预期词长加权 (expected_length_weight): 两码一字方案 L 码对应 floor(L/2) 字
-        if cfg.expected_length_weight > 0 and #ordered > 1 and fused_scores then
-            local expected_len = math.floor(#input / 2)
+        -- 预期词长加权 (expected_length_weight)：pdbj 每字 3 码，
+        -- 期望词长由 expected_word_len(input) 给出（6 码按 Z 位置区分：
+        -- 第 6 位 Z = 二字词 2 字；第 4/5 位 Z = 单字+补充码 1 字；
+        -- ≥9 码 = "3 字及以上"）。修正后本项才可能真正影响排序，
+        -- 加成幅度待离线评测（P3）标定，2026-10-01 起配置权重先置 0。
+        local exp_len, exp_ge = expected_word_len(input)
+        if cfg.expected_length_weight > 0 and #ordered > 1 and fused_scores and exp_len then
             local min_score, max_score
             for _, c in ipairs(ordered) do
                 local s = scores[c.text]
@@ -347,7 +373,7 @@ return function(translation, env)
                 end
             end
             local span = (min_score and max_score) and (max_score - min_score) or 0
-            if expected_len >= 1 and span > 0 then
+            if span > 0 then
                 local arr, ok2 = {}, true
                 for i, c in ipairs(ordered) do
                     local f = fused_scores[c.text]
@@ -357,7 +383,8 @@ return function(translation, env)
                     end
                     local len = utf8.len(c.text or "") or 0
                     arr[i] = { c = c, s = f,
-                               m = (len == expected_len), idx = i }
+                               m = exp_ge and (len >= exp_len) or (len == exp_len),
+                               idx = i }
                 end
                 if ok2 then
                     for _, item in ipairs(arr) do

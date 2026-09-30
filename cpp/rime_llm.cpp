@@ -20,6 +20,7 @@
 // Linux/fcitx5 移植（2026-10-01）：无 COM/UIA，仅需 POSIX 文件 API
 #include <sys/stat.h>
 #include <cstdio>
+#include <time.h>   // 日志时间戳: clock_gettime / localtime_r（2026-10-01 加）
 #endif
 
 extern "C" {
@@ -116,6 +117,25 @@ static int g_score_log_cnt = 0;  // score 日志限频计数器
 // ============================================================
 static std::string g_log_dir;
 
+// 本地时间戳 "HH:MM:SS.mmm"（2026-10-01 加：原日志无时间，
+// 无法与 events 文件对齐，也无法还原 prepare/score 的先后时序）
+static void now_stamp(char * out, size_t n) {
+#ifdef _WIN32
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(out, n, "%02d:%02d:%02d.%03d",
+             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tmv;
+    localtime_r(&ts.tv_sec, &tmv);
+    snprintf(out, n, "%02d:%02d:%02d.%03d",
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
+             (int)(ts.tv_nsec / 1000000L));
+#endif
+}
+
 static void log_msg(const char * fmt, ...) {
     char buf[512];
     va_list ap;
@@ -155,7 +175,12 @@ static void log_msg(const char * fmt, ...) {
     }
 #endif
     FILE * f = fopen(path, "a");
-    if (f) { fprintf(f, "%s\n", buf); fclose(f); }
+    if (f) {
+        char tbuf[32];
+        now_stamp(tbuf, sizeof(tbuf));
+        fprintf(f, "%s %s\n", tbuf, buf);
+        fclose(f);
+    }
 }
 
 
@@ -1215,6 +1240,7 @@ static void prepare(const std::vector<llama_token> & ctx_ids, int seq) {
         log_msg("prepare: SKIP stale seq=%d current=%d ctx_tok=%d", seq, g_prep_seq.load(), ctx_len);
         return;
     }
+    auto tp0 = std::chrono::high_resolution_clock::now();
     log_msg("prepare: start ctx_tok=%d seq=%d", ctx_len, seq);
     int vs = llama_n_vocab(g_vocab);
     auto* mem = llama_get_memory(g_ctx);
@@ -1251,7 +1277,9 @@ static void prepare(const std::vector<llama_token> & ctx_ids, int seq) {
     g_prep_gen = g_seq0_gen;
     g_prep_ctx = ctx_ids;
     g_prep_ready = true;
-    log_msg("prepare: done ctx_tok=%d seq=%d", ctx_len, seq);
+    double took_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::high_resolution_clock::now() - tp0).count();
+    log_msg("prepare: done ctx_tok=%d seq=%d took=%.0fms", ctx_len, seq, took_ms);
 }
 
 // ============================================================

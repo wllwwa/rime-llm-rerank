@@ -52,6 +52,24 @@ local function reset_history()
     prev_hist = {}
 end
 
+-- 仅从 commit_history 快照重建 history（纯读 commit_base、写 history，无副作用）。
+-- 按键路径的同步段与 commit_notifier 回调共用，保证两处算出的上文字符串
+-- 完全一致（不一致会让 C++ 预解码永不命中 → 每次 score 走完整解码）。
+local function rebuild_history(all)
+    if not all then return end
+    -- 引擎清空 commit_history（退格等）→ 基座重置重新计数
+    if #all < commit_base then commit_base = 0 end
+    if #all > commit_base then
+        history = {}
+        for i = commit_base + 1, #all do
+            local entry = all[i]
+            if entry and entry.text and #entry.text >= 1 then
+                table.insert(history, entry.text)
+            end
+        end
+    end
+end
+
 -- 异步预解码触发（归一化 + 去重，按键路径与编辑键重置路径共用）。
 -- ctx 归一化与 llm_filter 一致 (去空白): C++ prep 命中 = token 序列比较,
 -- 不一致会导致 prep 永远不命中 → 每次 score 完整解码 (~50ms)。
@@ -62,6 +80,24 @@ local function trigger_prepare()
         last_prep_ctx = cur_ctx
         llm_prep.prepare(cur_ctx)
     end
+end
+
+-- 上屏即时预习（2026-10-01 修 wait 卡顿）：commit_notifier 在"上屏已写入
+-- commit_history 之后"同步触发（librime 序：Context::Commit → ConcreteEngine::
+-- OnCommit Push 历史 → 本回调），回调里能读到含新词的历史。回调只做"重建
+-- 上文字符串 + 启动异步预习"——把 ctx decode 藏进用户想下一个词的间隙；
+-- 此前预习要等下一次按键才启动，与同键 score 抢锁，实测 wait 100~167ms。
+-- 注意：绝不能在此触发写语料/词频/prev_hist 等一次性副作用（processor 照旧）。
+-- 每个组件实例只连接一次；连接失败则下次按键重试，不影响任何既有路径。
+local commit_hook_done = false
+local function on_commit(ctx)
+    if not llm_prep then return end
+    local ch = ctx and ctx.commit_history
+    if ch then
+        local ok, all = pcall(function() return ch:to_table() end)
+        if ok then rebuild_history(all) end
+    end
+    trigger_prepare()
 end
 
 local function append_raw(text)
@@ -197,6 +233,13 @@ local function processor(key, env)
                 local okd, ud = pcall(function() return rime_api.get_user_data_dir() end)
                 if okd and ud and ud ~= "" then result.log_dir = ud end
                 llm_prep = result
+                -- 上屏即预习（见 on_commit 注释）：每个组件实例只连一次，
+                -- 失败（如 notifier 不可用）下次按键重试，不影响既有路径
+                if not commit_hook_done then
+                    commit_hook_done = pcall(function()
+                        env.engine.context.commit_notifier:connect(on_commit)
+                    end)
+                end
             end
         end
         -- model_path 每键轻量同步（仅变化时写，2026-08-31 修配置不生效的
@@ -301,21 +344,11 @@ local function processor(key, env)
         return 0
     end
 
-    -- 同步 commit_history
+    -- 同步 commit_history（history 重建与 commit 回调共用 rebuild_history，
+    -- 含"引擎清空 → 基座重置"；写语料/词频/prev_hist 等副作用仍只在此执行）
     local all = ch:to_table()
-    -- 引擎清空 commit_history（退格等）→ 基座重置重新计数
-    if all and #all < commit_base then
-        commit_base = 0
-    end
+    rebuild_history(all)
     if all and #all > commit_base then
-        history = {}
-        for i = commit_base + 1, #all do
-            local entry = all[i]
-            if entry and entry.text and #entry.text >= 1 then
-                table.insert(history, entry.text)
-            end
-        end
-
         local overlap = find_overlap(prev_hist, history)
         local new_words = {}
         for i = overlap + 1, #history do
