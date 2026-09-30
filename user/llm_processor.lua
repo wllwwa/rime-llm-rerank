@@ -1,4 +1,4 @@
-﻿-- llm_processor.lua — 上屏文字收集 + 预解码触发
+-- llm_processor.lua — 上屏文字收集 + 预解码触发
 -- 输出格式（一个场景一行）：
 --   词1\t码1|词2\t码2|←|词3\t码3
 --   | 分隔条目，\t 分隔词和码，← 退格，无码时码为空串
@@ -65,7 +65,7 @@ local function trigger_prepare()
 end
 
 local function append_raw(text)
-    local f = io.open(rime_api.get_user_data_dir() .. "\\llm_training.txt", "a")
+    local f = io.open(rime_api.get_user_data_dir() .. "/llm_training.txt", "a")
     if f then
         f:write(text)
         f:close()
@@ -89,7 +89,7 @@ local FREQ_TAU = 200
 local FREQ_FLUSH = 20
 local freq_dirty = 0
 local function freq_file()
-    return rime_api.get_user_data_dir() .. "\\user_freq.tsv"
+    return rime_api.get_user_data_dir() .. "/user_freq.tsv"
 end
 local function freq_load()
     _G.user_word_freq = _G.user_word_freq or {}
@@ -183,6 +183,15 @@ local function processor(key, env)
     else
         if not llm_prep then
             local ok, result = pcall(require, "rime_llm")
+            if not ok then
+                -- Linux shim（2026-10-01 移植）：require 失败时绝对路径
+                -- loadlib；filter 侧若已写过 package.loaded 则上面 require
+                -- 直接命中同一实例，不会走到这里
+                local fn = package.loadlib("/usr/lib/rime-plugins/librime-llm.so",
+                                           "luaopen_rime_llm")
+                if fn then ok, result = pcall(fn) end
+                if ok and result then package.loaded.rime_llm = result end
+            end
             if ok then
                 -- 日志目录: RIME 用户目录 (与 filter 共用同一模块实例)
                 local okd, ud = pcall(function() return rime_api.get_user_data_dir() end)
@@ -278,7 +287,7 @@ local function processor(key, env)
         if sc:get_bool("llm_rerank/debug_fusion") then
             pcall(function()
                 local f = io.open(rime_api.get_user_data_dir()
-                    .. "\\rime_llm_debug.txt", "a")
+                    .. "/rime_llm_debug.txt", "a")
                 if f then
                     f:write(string.format(
                         "%s|reset|编辑键(%s)→上文重置+缓存清空\n",
@@ -342,7 +351,7 @@ local function processor(key, env)
                     if dbg_flag then
                         pcall(function()
                             local f = io.open(rime_api.get_user_data_dir()
-                                .. "\\rime_llm_debug.txt", "a")
+                                .. "/rime_llm_debug.txt", "a")
                             if f then
                                 f:write(string.format(
                                     "%s|commit|词=%s|码=%s|eff %.3f→%.3f|tick %d→%d|flush脏%d/20\n",

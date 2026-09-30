@@ -5,6 +5,7 @@
  * Lua:  require("rime_llm") → llm.score(ctx, cands)
  */
 
+#ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
 #include <objbase.h>
@@ -15,6 +16,11 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "UIAutomationCore.lib")
+#else
+// Linux/fcitx5 移植（2026-10-01）：无 COM/UIA，仅需 POSIX 文件 API
+#include <sys/stat.h>
+#include <cstdio>
+#endif
 
 extern "C" {
 #include <lua.h>
@@ -47,9 +53,19 @@ extern "C" {
 // gguf_models\。自定义位置用 schema model_path 显式指向。便携模式小狼毫
 // 的用户目录不在 %APPDATA%\Rime，此类部署需显式配置 model_path）
 static std::string default_model_path() {
+#ifdef _WIN32
   const char *ad = getenv("APPDATA");
   if (ad && *ad)
     return std::string(ad) + "\\Rime\\Qwen3.5-0.8B-Q4_K_M.gguf";
+#else
+  // Linux：默认 RIME 用户目录根（fcitx5 = $XDG_DATA_HOME/fcitx5/rime）
+  const char *xdg = getenv("XDG_DATA_HOME");
+  if (xdg && *xdg)
+    return std::string(xdg) + "/fcitx5/rime/Qwen3.5-0.8B-Q4_K_M.gguf";
+  const char *home = getenv("HOME");
+  if (home && *home)
+    return std::string(home) + "/.local/share/fcitx5/rime/Qwen3.5-0.8B-Q4_K_M.gguf";
+#endif
   return "Qwen3.5-0.8B-Q4_K_M.gguf";
 }
 static std::string  g_model_path      = default_model_path();
@@ -106,6 +122,7 @@ static void log_msg(const char * fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+#ifdef _WIN32
     char path[MAX_PATH];
     if (!g_log_dir.empty() && g_log_dir.size() < MAX_PATH - 32) {
         strcpy_s(path, g_log_dir.c_str());
@@ -124,6 +141,19 @@ static void log_msg(const char * fmt, ...) {
         DeleteFileA(oldp.c_str());
         MoveFileA(path, oldp.c_str());
     }
+#else
+    char path[512];
+    if (!g_log_dir.empty() && g_log_dir.size() < sizeof(path) - 32)
+        snprintf(path, sizeof(path), "%s/rime_llm_log.txt", g_log_dir.c_str());
+    else
+        snprintf(path, sizeof(path), "/tmp/rime_llm_log.txt");
+    struct stat st;
+    if (stat(path, &st) == 0 && st.st_size > 5 * 1024 * 1024) {
+        std::string oldp = std::string(path) + ".old";
+        remove(oldp.c_str());
+        rename(path, oldp.c_str());
+    }
+#endif
     FILE * f = fopen(path, "a");
     if (f) { fprintf(f, "%s\n", buf); fclose(f); }
 }
@@ -144,6 +174,8 @@ static void log_msg(const char * fmt, ...) {
 // commit 编辑事件原本是盲区，旧快照 2.5s 新鲜窗内冒充真文）。
 // lua 调用线程经 mutex 快照消费，COM/UIA 调用绝不在按键同步路径。
 // ============================================================
+#ifdef _WIN32
+
 namespace ctxlink {
 
 static std::mutex g_mu;
@@ -785,6 +817,22 @@ static bool pick(std::string & text, const char *& src) {
 
 }  // namespace ctxlink
 
+#else
+// Linux/fcitx5：无 COM/UIA 光标采集旁路。所有入口保持原签名，
+// pick 恒失败 → lua 侧回落 commit_history 上文（AI·历史 徽章）；
+// fcitx5 每个窗口独立 rime 会话，commit_history 天然按应用隔离。
+namespace ctxlink {
+
+inline void ensure_started() {}
+inline void kick() {}
+inline void edit_reset() {}
+inline bool pick(std::string &, const char * &) { return false; }
+inline unsigned long foreground_pid() { return 0; }
+
+}  // namespace ctxlink
+
+#endif  // _WIN32
+
 
 // ============================================================
 // 异步模型加载
@@ -1342,6 +1390,7 @@ static int lua_edit_reset_context(lua_State * L) {
 // （Chrome 双窗、Win11 记事本标签，pid 相同），旧窗历史照样冒充；HWND
 // 级对齐源码版 TSF prevFocus!=focus。候选窗不抢前台，打字中不误触。
 static int lua_fg_changed(lua_State * L) {
+#ifdef _WIN32
     static DWORD last_pid = 0;
     static HWND last_hwnd = nullptr;
     DWORD cur_pid = ctxlink::foreground_pid();
@@ -1351,6 +1400,10 @@ static int lua_fg_changed(lua_State * L) {
     last_pid = cur_pid;
     last_hwnd = cur_hwnd;
     lua_pushboolean(L, changed ? 1 : 0);
+#else
+    // Linux：无前台窗口检测；fcitx5 每窗口独立 rime 会话，历史按应用隔离
+    lua_pushboolean(L, 0);
+#endif
     return 1;
 }
 
@@ -1362,12 +1415,17 @@ static int lua_fg_changed(lua_State * L) {
 // GetAsyncKeyState LSB=自本进程上次查询以来按下过，专为轮询设计；
 // 首次调用建立基线防进程历史点击误报。
 static int lua_click_happened(lua_State * L) {
+#ifdef _WIN32
     static bool inited = false;
     short b = GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) |
               GetAsyncKeyState(VK_MBUTTON);
     bool clicked = inited && (b & 1);
     inited = true;
     lua_pushboolean(L, clicked ? 1 : 0);
+#else
+    // Linux：无全局鼠标轮询；点击移光标后历史上文过期属已知限制
+    lua_pushboolean(L, 0);
+#endif
     return 1;
 }
 
@@ -1472,7 +1530,12 @@ static int lua_newindex(lua_State * L) {
 // ============================================================
 // 模块入口
 // ============================================================
+#ifdef _WIN32
 extern "C" __declspec(dllexport) int luaopen_rime_llm(lua_State * L) {
+#else
+extern "C" __attribute__((visibility("default")))
+int luaopen_rime_llm(lua_State * L) {
+#endif
     lua_newtable(L);
 
     lua_pushcfunction(L, lua_score);

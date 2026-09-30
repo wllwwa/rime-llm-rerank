@@ -78,9 +78,26 @@ local function get_scores(cands)    if not llm or not llm.get_scores then return
     return scores
 end
 
-local function load_llm(env)
+-- rime_llm 加载 shim（2026-10-01 Linux 移植）：librime-lua 的 package.cpath
+-- 不含 /usr/lib/rime-plugins，require 失败时退回绝对路径 loadlib，
+-- 并写入 package.loaded 供 processor 侧 require 直接命中同一实例
+local function load_rime_llm()
     local ok, cpp = pcall(require, "rime_llm")
-    if ok and cpp then
+    if ok and cpp then return cpp end
+    local fn = package.loadlib("/usr/lib/rime-plugins/librime-llm.so",
+                               "luaopen_rime_llm")
+    if not fn then return nil end
+    local ok2, cpp2 = pcall(fn)
+    if ok2 and cpp2 then
+        package.loaded.rime_llm = cpp2
+        return cpp2
+    end
+    return nil
+end
+
+local function load_llm(env)
+    local cpp = load_rime_llm()
+    if cpp then
         local sc = env.engine.schema.config
         local mp = sc:get_string("llm_rerank/model_path")
         -- 未配置时留给 C++ 默认（RIME 用户目录根，2026-08-31）
@@ -205,9 +222,9 @@ return function(translation, env)
         -- Event log (仅真实推理时写; RIME 用户目录, 回退 %TEMP%)
         local okd, log_dir = pcall(function() return rime_api.get_user_data_dir() end)
         if not okd or not log_dir or log_dir == "" then
-            log_dir = os.getenv("TEMP") or "C:\\Windows\\Temp"
+            log_dir = os.getenv("TMPDIR") or "/tmp"
         end
-        local epath = log_dir .. "\\rime_llm_events.txt"
+        local epath = log_dir .. "/rime_llm_events.txt"
         local ef = io.open(epath, "a")
         -- 日志轮转 (2026-09-04): >5MB 改名 .old (单文件轮转), 防无限增长
         if ef then
@@ -399,7 +416,7 @@ return function(translation, env)
             end
             local okw = pcall(function()
                 local f = io.open(rime_api.get_user_data_dir()
-                                  .. "\\rime_llm_debug.txt", "a")
+                                  .. "/rime_llm_debug.txt", "a")
                 if f then
                     f:write(table.concat(dbg, "\n") .. "\n\n")
                     f:close()
