@@ -127,7 +127,7 @@ static std::atomic<int>         g_pending_seq{0}; // 槽内 ctx 对应的请求�
 static bool                      g_pending_valid = false;
 static std::atomic<bool>        g_prep_stop{false};
 static std::atomic<bool>        g_prep_worker_started{false};
-static std::thread               g_prep_worker_thread;  // 供退出时 join
+static std::atomic<bool>        g_prep_worker_running{false};  // worker 存活标记（退出时有界等待用）
 static std::atomic<int>         g_score_waiting{0}; // 正在等锁的 score 数
 static std::atomic<int>         g_score_active{0};  // 持锁执行的 score 数
 static std::atomic<int>         g_prep_superseded{0}; // 被更新取代的请求数（诊断）
@@ -1338,12 +1338,13 @@ static bool prep_take(std::vector<llama_token> & out, int & seq) {
 
 // 常驻 worker：取最新请求 → 抢锁（抢不到就退避重试，**不丢弃**）→ 解码发布。
 static void prep_worker() {
-    for (;;) {
+    g_prep_worker_running.store(true);
+    while (!g_prep_stop.load()) {
         std::vector<llama_token> ctx;
         int seq = 0;
-        if (!prep_take(ctx, seq)) return;
+        if (!prep_take(ctx, seq)) break;
         for (;;) {
-            if (g_prep_stop.load()) return;
+            if (g_prep_stop.load()) break;
             // 已被更新的请求取代：这是唯一合法的"作废"（旧 ctx 已无人需要）
             if (seq != g_prep_seq.load()) {
                 g_prep_superseded.fetch_add(1);
@@ -1377,23 +1378,30 @@ static void prep_worker() {
             break;
         }
     }
+    g_prep_worker_running.store(false);
 }
 
 static void ensure_prep_worker() {
     bool expected = false;
     if (g_prep_worker_started.compare_exchange_strong(expected, true)) {
-        g_prep_worker_thread = std::thread(prep_worker);
+        // detach 而不是留一个可 join 的 std::thread 全局：那个全局在静态析构期
+        // 若仍 joinable，标准库会直接 std::terminate（实测退出时报
+        // "terminate called without an active exception" / abort），而 librime
+        // 的模块 finalize 时机不受我们控制。退出用下面的存活标记手写有界等待。
+        std::thread(prep_worker).detach();
     }
 }
 
-// 由 llm_module.cc 的 finalize 调用：停 worker 并等它退出。
-// 为什么需要它：worker 可能正持着 g_mutex 在解码，此时进程退出 / 模型析构就是
-// use-after-free —— 原实现"每次 prepare 起一个 detached 线程"在离线基准的退出
-// 阶段偶发 core dump，正是这一类竞争。
+// 由 llm_module.cc 的 finalize 调用：停 worker 并等它收尾。
+// 为什么需要它：worker 可能正持着 g_mutex 在解码，此时模型被卸载 / 进程收尾
+// 就是 use-after-free——原实现"每次 prepare 起一个 detached 线程"在离线基准的
+// 退出阶段偶发崩溃，正是这一类竞争。
 void rime_llm_shutdown() {
     g_prep_stop.store(true);
     g_prep_cv.notify_all();
-    if (g_prep_worker_thread.joinable()) g_prep_worker_thread.join();
+    // 有界等待（最长 1s，一次 decode 最多 ~90ms）。不 join，见 ensure_prep_worker。
+    for (int i = 0; i < 500 && g_prep_worker_running.load(); i++)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
 }
 
 // ============================================================

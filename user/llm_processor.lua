@@ -3,21 +3,76 @@
 --   词1\t码1|词2\t码2|←|词3\t码3
 --   | 分隔条目，\t 分隔词和码，← 退格，无码时码为空串
 
-local prev_hist = {}     -- 上次 history 快照
-local history = {}       -- 当前上屏词序列
-local commit_base = 0    -- 上文基座: 只认 commit_history 中 base 之后的新词
-                         -- (编辑键后旧词永久忽略——librime 无法清 commit_history)
+-- 状态归属（2026-10-01 改）：**每个组件实例一份，存在 env 上**。
+-- 为什么不能再用脚本顶层 local：librime-lua 全进程只建一个 Lua 实例
+-- （plugins/lua/src/modules.cc:93-106），顶层 local 是**所有窗口共享**的。多窗口
+-- 下会互相覆盖：history/commit_base 串台；更严重的是 commit_hook_done 是模块级，
+-- 第二个窗口的 processor 根本不连自己的 commit_notifier —— 上屏即预习在第二窗口
+-- 完全失效。而 env 是 librime-lua 为**每个组件实例**建的表（raw_init 里
+-- lua_newtable；每个 session 有自己的 Engine → 自己的组件实例 → 自己的 env），
+-- 官方示例也写明可以往 env 上挂自定义字段。
+-- 轻量诊断日志：写 C++ 侧那份 rime_llm_log.txt。
+-- 格式刻意**不带毫秒**（分析脚本只认 "HH:MM:SS.mmm" 开头的行），所以这些行
+-- 不会被算进 prepare/score 的统计，只是给人看的路标。多窗口验证就靠这些行：
+-- 两个窗口各应出现一组"实例状态已建立 / commit 钩子已连接"。
+local function plog(msg)
+    local ok, ud = pcall(function() return rime_api.get_user_data_dir() end)
+    if not ok or not ud or ud == "" then return end
+    local f = io.open(ud .. "/rime_llm_log.txt", "a")
+    if f then
+        f:write(string.format("%s component: %s\n", os.date("%H:%M:%S"), msg))
+        f:close()
+    end
+end
+
+local function new_state()
+    return {
+        history = {},        -- 当前上屏词序列
+        prev_hist = {},      -- 上次 history 快照
+        commit_base = 0,     -- 上文基座: 只认 commit_history 中 base 之后的新词
+                             -- (编辑键后旧词永久忽略——librime 无法清 commit_history)
+        prev_input = "",     -- 上一轮的输入码
+        pending_code = "",   -- 手动选词上屏码（输入变空瞬间捕获）
+        last_full = "",      -- 最后满码（4码），顶屏时回退用
+        last_prep_ctx = "",  -- 上次 prepare 的 context，避免重复调用
+        commit_conn = nil,   -- 本实例的 commit_notifier 连接（fini 时断开）
+    }
+end
+
+local fallback_state = nil   -- env 不可写时的兜底（退化为旧行为：单份共享状态）
+local last_state = nil       -- 最近一次 processor 调用的实例状态（仅供 _G.llm_context_get 兜底）
+
+-- 取本实例状态。写回后校验一次：若 env 不可写会**静默退化成"每次都是空
+-- history"**——那会让每次评分都付一次同步解码（~70ms），是隐性性能回归，所以
+-- 校验失败要告警并退回共享状态（等价于改造前的行为，不影响正确性）。
+local function state_of(env)
+    local st = env.__llm_state
+    if st then return st end
+    local cand = new_state()
+    env.__llm_state = cand
+    if env.__llm_state == cand then
+        plog("实例状态已建立（每会话一份；多窗口会各出现一次）")
+        return cand
+    end
+    if not fallback_state then
+        fallback_state = cand
+        local f = io.open(rime_api.get_user_data_dir() .. "/rime_llm_log.txt", "a")
+        if f then
+            f:write(string.format("%s prepare: WARN env 不可写，组件状态退回全局共享\n",
+                                  os.date("%H:%M:%S")))
+            f:close()
+        end
+    end
+    return fallback_state
+end
+
 local com_ctx_enabled = true  -- COM/UIA 光标上文旁路总开关（2026-09-29 定案：
                               -- 不做配置项、无关闭态；排障直接改此值）
 local SPLIT = "|"
 local TAB = "\t"
 local BSP = "←"
-local prev_input = ""    -- 上一轮的输入码
-local pending_code = ""  -- 手动选词上屏码（输入变空瞬间捕获）
-local last_full = ""     -- 最后满码（4码），顶屏时回退用
 local MAX_CODE = 4       -- 满码长度
-local llm_prep = nil     -- 缓存的 llm 模块 (for prepare)
-local last_prep_ctx = "" -- 上次 prepare 的 context，避免重复调用
+local llm_prep = nil     -- 缓存的 llm 模块（全进程一份：lua 的 package.loaded）
 
 local NAV_KEYS = { Left=true, Right=true, Up=true, Down=true,
                    Home=true, End=true, Page_Up=true, Page_Down=true }
@@ -47,24 +102,26 @@ local function is_edit_key(k)
     return false
 end
 
-local function reset_history()
-    history = {}
-    prev_hist = {}
+local get_context   -- 前置声明（trigger_prepare 要用，定义在文件后半）
+
+local function reset_history(st)
+    st.history = {}
+    st.prev_hist = {}
 end
 
 -- 仅从 commit_history 快照重建 history（纯读 commit_base、写 history，无副作用）。
 -- 按键路径的同步段与 commit_notifier 回调共用，保证两处算出的上文字符串
 -- 完全一致（不一致会让 C++ 预解码永不命中 → 每次 score 走完整解码）。
-local function rebuild_history(all)
+local function rebuild_history(st, all)
     if not all then return end
     -- 引擎清空 commit_history（退格等）→ 基座重置重新计数
-    if #all < commit_base then commit_base = 0 end
-    if #all > commit_base then
-        history = {}
-        for i = commit_base + 1, #all do
+    if #all < st.commit_base then st.commit_base = 0 end
+    if #all > st.commit_base then
+        st.history = {}
+        for i = st.commit_base + 1, #all do
             local entry = all[i]
             if entry and entry.text and #entry.text >= 1 then
-                table.insert(history, entry.text)
+                table.insert(st.history, entry.text)
             end
         end
     end
@@ -74,10 +131,10 @@ end
 -- ctx 归一化与 llm_filter 一致 (去空白): C++ prep 命中 = token 序列比较,
 -- 不一致会导致 prep 永远不命中 → 每次 score 完整解码 (~50ms)。
 -- 中文无空白两者相同; 含英文/空格 (如 "Hello world 你好") 时保证一致。
-local function trigger_prepare()
-    local cur_ctx = (_G.llm_context_get() or ""):gsub('%s+', '')
-    if llm_prep and llm_prep.prepare and cur_ctx ~= last_prep_ctx then
-        last_prep_ctx = cur_ctx
+local function trigger_prepare(st)
+    local cur_ctx = (get_context(st) or ""):gsub('%s+', '')
+    if llm_prep and llm_prep.prepare and cur_ctx ~= st.last_prep_ctx then
+        st.last_prep_ctx = cur_ctx
         llm_prep.prepare(cur_ctx)
     end
 end
@@ -88,16 +145,25 @@ end
 -- 上文字符串 + 启动异步预习"——把 ctx decode 藏进用户想下一个词的间隙；
 -- 此前预习要等下一次按键才启动，与同键 score 抢锁，实测 wait 100~167ms。
 -- 注意：绝不能在此触发写语料/词频/prev_hist 等一次性副作用（processor 照旧）。
--- 每个组件实例只连接一次；连接失败则下次按键重试，不影响任何既有路径。
-local commit_hook_done = false
-local function on_commit(ctx)
-    if not llm_prep then return end
-    local ch = ctx and ctx.commit_history
-    if ch then
-        local ok, all = pcall(function() return ch:to_table() end)
-        if ok then rebuild_history(all) end
+-- 2026-10-01 改：**每个实例连自己的 context**（原来用模块级 commit_hook_done
+-- 只让第一个实例连上，第二个窗口因此完全不预习），并把回调写成捕获本实例状态
+-- 的闭包；连接保存在 state 里，fini 时断开。
+local function connect_commit_hook(env, st)
+    if st.commit_conn then return end
+    local ok, conn = pcall(function()
+        return env.engine.context.commit_notifier:connect(function(ctx)
+            local ch = ctx and ctx.commit_history
+            if ch then
+                local ok2, all = pcall(function() return ch:to_table() end)
+                if ok2 then rebuild_history(st, all) end
+            end
+            trigger_prepare(st)
+        end)
+    end)
+    if ok and conn then
+        st.commit_conn = conn
+        plog("commit 钩子已连接（本实例的 context；多窗口会各出现一次）")
     end
-    trigger_prepare()
 end
 
 local function append_raw(text)
@@ -210,6 +276,10 @@ end
 
 local function processor(key, env)
     if key:release() then return 2 end
+    -- 本实例状态（每个 session 一份）；同时记为"最近一次调用的状态"，
+    -- 供 llm_filter 经 _G.llm_context_get 兜底读取（见文件末说明）
+    local st = state_of(env)
+    last_state = st
 
     -- 上文检查 + 预解码 (每次按键): commit_history 变化 → 立即异步预解码
     local sc = env.engine.schema.config
@@ -233,13 +303,8 @@ local function processor(key, env)
                 local okd, ud = pcall(function() return rime_api.get_user_data_dir() end)
                 if okd and ud and ud ~= "" then result.log_dir = ud end
                 llm_prep = result
-                -- 上屏即预习（见 on_commit 注释）：每个组件实例只连一次，
-                -- 失败（如 notifier 不可用）下次按键重试，不影响既有路径
-                if not commit_hook_done then
-                    commit_hook_done = pcall(function()
-                        env.engine.context.commit_notifier:connect(on_commit)
-                    end)
-                end
+                -- 上屏即预习：每个实例连自己的 context（见 connect_commit_hook）
+                connect_commit_hook(env, st)
             end
         end
         -- model_path 每键轻量同步（仅变化时写，2026-08-31 修配置不生效的
@@ -277,8 +342,8 @@ local function processor(key, env)
     -- 快照也是旧时刻的，点击移光标后同样冒充）
     if llm_prep and llm_prep.click_happened and llm_prep.click_happened() then
         local ch0 = env.engine.context.commit_history
-        if ch0 then commit_base = #ch0:to_table() end
-        reset_history()
+        if ch0 then st.commit_base = #ch0:to_table() end
+        reset_history(st)
         -- 点击候选窗选词场景：commit kick 刚刷新的正确快照会被废，但
         -- kick 50ms 后读回同样正确的文本（点击已处理完、含新上屏词），自愈
         if llm_prep.edit_reset_context then
@@ -287,7 +352,7 @@ local function processor(key, env)
     end
 
     -- 上文检查 + 预解码 (每次按键): commit_history 变化 → 立即异步预解码
-    trigger_prepare()
+    trigger_prepare(st)
 
     local ctx = env.engine.context
     local ch = ctx.commit_history
@@ -300,21 +365,21 @@ local function processor(key, env)
     -- 比 pid 不比 HWND：同应用内对话框/多文档窗口不误清。
     if llm_prep and llm_prep.fg_changed and llm_prep.fg_changed() then
         local all0 = ch:to_table()
-        commit_base = #all0
-        reset_history()
+        st.commit_base = #all0
+        reset_history(st)
     end
 
     -- 追踪满码（顶屏时回退用）
     if ctx.input ~= "" and #ctx.input >= MAX_CODE then
-        last_full = ctx.input
+        st.last_full = ctx.input
     end
 
     -- 输入变空 → 捕获本次上屏码（手动选词、Tab、数字键）
-    if prev_input ~= "" and ctx.input == "" then
-        pending_code = prev_input
-        last_full = ""  -- 已消费
+    if st.prev_input ~= "" and ctx.input == "" then
+        st.pending_code = st.prev_input
+        st.last_full = ""  -- 已消费
     end
-    prev_input = ctx.input
+    st.prev_input = ctx.input
 
     -- 退格 / Delete / 导航键 (composition 为空时): 编辑位置变化
     --   rime 来源上文重置为空 (会话上屏词序列不再代表光标前上文), 立即重新预解码
@@ -324,17 +389,17 @@ local function processor(key, env)
     if ctx.input == "" and is_edit_key(key:repr()) then
         local k = key:repr()
         if is_nav_ish_key(k) then
-            if #history > 0 then
+            if #st.history > 0 then
                 append_raw("\n")
             end
-        elseif #history > 0 then
+        elseif #st.history > 0 then
             append_raw(SPLIT .. BSP)
         end
-        reset_history()
+        reset_history(st)
         -- 编辑键: 当前 commit_history 位置记为基座——旧词永久忽略
         -- (librime lua 无法清 commit_history, 旧词留在引擎里;
         --  退格会被引擎清空 commit_history → 同步段检测缩短自动重置基座)
-        commit_base = #ch:to_table()
+        st.commit_base = #ch:to_table()
         -- 编辑后重打相同词 (ctx+input 相同) 必须重新推理: 清空 filter 结果缓存
         _G.llm_filter_cache = nil
         -- 2026-09-12 信号层统一: COM/UIA 快照失效 + kick 延迟重读(~50ms)——
@@ -356,19 +421,19 @@ local function processor(key, env)
             end)
         end
         -- 上文已重置 → 立即异步预解码 (空上文)
-        trigger_prepare()
+        trigger_prepare(st)
         return 0
     end
 
     -- 同步 commit_history（history 重建与 commit 回调共用 rebuild_history，
     -- 含"引擎清空 → 基座重置"；写语料/词频/prev_hist 等副作用仍只在此执行）
     local all = ch:to_table()
-    rebuild_history(all)
-    if all and #all > commit_base then
-        local overlap = find_overlap(prev_hist, history)
+    rebuild_history(st, all)
+    if all and #all > st.commit_base then
+        local overlap = find_overlap(st.prev_hist, st.history)
         local new_words = {}
-        for i = overlap + 1, #history do
-            table.insert(new_words, history[i])
+        for i = overlap + 1, #st.history do
+            table.insert(new_words, st.history[i])
         end
 
         if #new_words > 0 then
@@ -383,13 +448,13 @@ local function processor(key, env)
                 local code = ""
                 if has_chinese then
                     -- 优先手动捕获的码，其次满码（顶屏回退），用完即清
-                    code = pending_code
+                    code = st.pending_code
                     if code == "" then
-                        code = last_full
+                        code = st.last_full
                     end
                 end
-                pending_code = ""
-                last_full = ""
+                st.pending_code = ""
+                st.last_full = ""
                 -- 词频计数: 仅含中文的词 (含英文/数字/标点不参与融合)
                 if has_chinese then
                     if not _G.user_word_freq then freq_load() end  -- 诊断读数前先就位
@@ -437,20 +502,20 @@ local function processor(key, env)
             end
         end
 
-        if #new_words == 0 and #history < #prev_hist and #history < 3 then
-            pending_code = ""
-            last_full = ""
+        if #new_words == 0 and #st.history < #st.prev_hist and #st.history < 3 then
+            st.pending_code = ""
+            st.last_full = ""
             append_raw("\n")
         end
 
-        prev_hist = {}
-        for _, v in ipairs(history) do table.insert(prev_hist, v) end
+        st.prev_hist = {}
+        for _, v in ipairs(st.history) do table.insert(st.prev_hist, v) end
     end
 
     return 2
 end
 
-local function get_context()
+get_context = function(st)
     -- 三层上文（2026-09-10 全功能）：COM（Word/WPS 文字文档模型）→
     -- UIA TextPattern（通用现代应用）→ 上屏历史（兜底）。前两层由 DLL
     -- llm_context() 完成（前台门控 + 快照新鲜度 + 来源进程校验都在 C++，
@@ -462,8 +527,31 @@ local function get_context()
             return t, src
         end
     end
-    return table.concat(history, ""), "rime"
+    return table.concat(st.history, ""), "rime"
 end
 
-_G.llm_context_get = get_context
-return processor
+-- llm_filter 取上文的入口。**它是全进程单值**：多窗口下可能读到另一个窗口最近
+-- 一次调用写的上文。本可以改成"每会话 Context 属性"通道，但实测不可行——
+-- Context::set_property 会触发 ConcreteEngine::OnPropertyUpdate →
+-- message_sink_("property", ...) + LOG(INFO)（src/rime/engine.cc:154-162），
+-- 每键一次通知客户端，代价不可接受；而 librime-lua 也不提供稳定的每会话标识
+-- （LuaType<T*>::pushdata 每次访问都新建 userdata，身份不稳定，不能当表键）。
+-- 单窗口下这就是本会话的上文，与改造前一致；多窗口的残余影响见 notes/fixes。
+_G.llm_context_get = function()
+    if last_state then return get_context(last_state) end
+    return "", "rime"
+end
+
+-- 组件析构时调用（librime-lua 在 LuaProcessor::~LuaProcessor 里调 fini(env)）：
+-- 断开本实例的 commit_notifier 连接。boost::signals2 的槽随 Context 销毁而释放，
+-- 所以这里主要是"重连前先断"的卫生；返回表形式 {'func','fini'} 是 librime-lua
+-- 支持的模块形状（plugins/lua/src/lua_gears.cc:121-166）。
+local function fini(env)
+    local st = env.__llm_state
+    if st and st.commit_conn then
+        pcall(function() st.commit_conn:disconnect() end)
+        st.commit_conn = nil
+    end
+end
+
+return { func = processor, fini = fini }
