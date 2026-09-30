@@ -254,6 +254,22 @@ local function processor(key, env)
             -- unload_model 清 s_cache 同理)——不清则同码重打期间继续用旧分
             _G.llm_filter_cache = nil
         end
+        -- cpu_cores / max_tokens 同理必须赶在 prepare 之前同步（2026-10-01）：
+        -- llama 上下文的线程数与 ctx 长度只在**创建时**读一次，而加载是
+        -- prepare 触发的、filter 要等第一次评分才写这两个值——谁先到看运气。
+        -- 实测同一份 cpu_cores: 8 的配置，日志里出现过 threads=8 也出现过
+        -- threads=4（后者连带 ctx 上限也没生效）。C++ 侧改成"值变化即卸载"，
+        -- 这里保证首次加载前就把值写好。
+        local thr = sc:get_int("llm_rerank/cpu_cores")
+        if thr and thr > 0 and llm_prep and llm_prep.n_threads ~= thr then
+            llm_prep.n_threads = thr
+            _G.llm_filter_cache = nil
+        end
+        local mtk = sc:get_int("llm_rerank/max_tokens")
+        if mtk and mtk > 0 and llm_prep and llm_prep.max_ctx ~= mtk then
+            llm_prep.max_ctx = mtk
+            _G.llm_filter_cache = nil
+        end
     end
     -- 鼠标点击检测（2026-09-11 深夜用户定案：任何点击=光标可能移动→
     -- 清历史上文兜底，不做例外排除——候选窗/工具栏点击也清，上下文

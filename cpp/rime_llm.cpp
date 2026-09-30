@@ -1558,8 +1558,26 @@ static int lua_newindex(lua_State * L) {
     }
     else if (strcmp(key, "max_ctx") == 0)    g_max_ctx_tokens = (int)luaL_checkinteger(L, 3);
     else if (strcmp(key, "min_tokens") == 0) g_min_tokens = (int)luaL_checkinteger(L, 3);
-    else if (strcmp(key, "n_threads") == 0)  g_n_threads = (int)luaL_checkinteger(L, 3);
-    else if (strcmp(key, "n_ctx") == 0)      g_n_ctx = (int)luaL_checkinteger(L, 3);
+    // 线程数/上下文长度只在 llama 上下文**创建时**生效（见 load_model_async 的
+    // cparams）。原实现只赋值不卸载，于是"改 cpu_cores 不重启 fcitx5 不生效"；
+    // 更隐蔽的是首次加载存在竞态——加载由 processor 的 prepare 触发，而
+    // `n_threads` 要等 filter 第一次评分才写进来，谁先到看运气（实测同一份配置
+    // 出现过 threads=8 也出现过 threads=4）。变更即卸载，下次 prepare/score 以
+    // 新参数重载；值相同时不动作，所以每键同步也不会反复卸载。
+    else if (strcmp(key, "n_threads") == 0) {
+        int v = (int)luaL_checkinteger(L, 3);
+        if (v != g_n_threads) {
+            g_n_threads = v;
+            if (g_loaded.load()) unload_model();
+        }
+    }
+    else if (strcmp(key, "n_ctx") == 0) {
+        int v = (int)luaL_checkinteger(L, 3);
+        if (v != g_n_ctx) {
+            g_n_ctx = v;
+            if (g_loaded.load()) unload_model();
+        }
+    }
     else if (strcmp(key, "n_seq_max") == 0)  g_n_seq_max = (int)luaL_checkinteger(L, 3);
     else if (strcmp(key, "log_dir") == 0)    g_log_dir = luaL_checkstring(L, 3);  // RIME 用户目录
     return 0;
