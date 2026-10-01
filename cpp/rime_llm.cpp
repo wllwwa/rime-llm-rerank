@@ -120,14 +120,19 @@ static long                      g_prep_gen = 0; // prepare 完成时的代次
 // 另外给 score 让路：worker 在"即将开始一次长 decode"前检查有无 score 在等锁/
 // 持锁，有就让路——score 是人等着的路径，预习只是投机，绝不能让新调度器给
 // score 加延迟（这是必须守住的约束）。
-static std::mutex               g_prep_mu;        // 保护待预习槽
-static std::condition_variable  g_prep_cv;
-static std::vector<llama_token> g_pending_ctx;    // 最新待预习 ctx（覆盖式）
+// 这三个**故意泄漏**（绑定到 new 出来的对象，不是命名空间作用域对象）：常驻 worker
+// 会永久停在 g_prep_cv 上等新请求，而 glibc 的 pthread_cond_destroy 会先广播、再
+// **等所有等待者离开**才返回——被唤醒的 worker 一看 g_pending_valid 仍为假，又回去
+// 等，于是 exit() 里的静态析构永远等不到它，进程挂死（离线基准实测：日志停在最后
+// 一条评分，进程数分钟不退出；真机上等价于 `fcitx5 -r` 卡住）。
+// 泄漏掉就根本没有析构，退出路径不再碰这把锁/这个 cv；worker 需要的内存也全都有效，
+// 不会出现"线程还在跑、对象已被回收"的静态析构顺序问题。
+static std::mutex               &g_prep_mu = *new std::mutex;        // 保护待预习槽
+static std::condition_variable  &g_prep_cv = *new std::condition_variable;
+static std::vector<llama_token> &g_pending_ctx = *new std::vector<llama_token>; // 最新待预习 ctx（覆盖式）
 static std::atomic<int>         g_pending_seq{0}; // 槽内 ctx 对应的请求号
 static bool                      g_pending_valid = false;
-static std::atomic<bool>        g_prep_stop{false};
 static std::atomic<bool>        g_prep_worker_started{false};
-static std::atomic<bool>        g_prep_worker_running{false};  // worker 存活标记（退出时有界等待用）
 static std::atomic<int>         g_score_waiting{0}; // 正在等锁的 score 数
 static std::atomic<int>         g_score_active{0};  // 持锁执行的 score 数
 static std::atomic<int>         g_prep_superseded{0}; // 被更新取代的请求数（诊断）
@@ -1325,26 +1330,33 @@ static void prep_decode_locked(const std::vector<llama_token> & ctx_ids, int seq
     log_msg("prepare: done ctx_tok=%d seq=%d took=%.0fms", ctx_len, seq, took_ms);
 }
 
-// 取走最新请求；收到停止信号返回 false。
-static bool prep_take(std::vector<llama_token> & out, int & seq) {
+// 取走最新请求（覆盖式槽位；只等请求，永不返回失败）。
+static void prep_take(std::vector<llama_token> & out, int & seq) {
     std::unique_lock<std::mutex> lk(g_prep_mu);
-    g_prep_cv.wait(lk, [] { return g_pending_valid || g_prep_stop.load(); });
-    if (g_prep_stop.load()) return false;
+    g_prep_cv.wait(lk, [] { return g_pending_valid; });
     out = g_pending_ctx;
     seq = g_pending_seq.load();
     g_pending_valid = false;
-    return true;
 }
 
 // 常驻 worker：取最新请求 → 抢锁（抢不到就退避重试，**不丢弃**）→ 解码发布。
+//
+// 它是**常驻**的：不设停止标志，随进程结束而消失（与上游 Windows 侧 ctxlink
+// 后台线程同一形态）。为什么不加"优雅停止"：librime 会在一个进程里走多轮
+// initialize/finalize（fcitx5 启动期的部署/重载就会），而停止标记是单向的——
+// 任何一次 finalize 置下它，之后的预习就**静默失效**。真机实测过这个回归：
+// 一轮 finalize 之后 31 次预习请求全部"未开始即被更新取代"、完成 0 次，只剩
+// score 自己同步解码。退出期也不需要它停：进程里没有任何析构路径会释放 llama
+// 上下文（只有 unload_model 会释放，而它要拿 g_mutex，与 worker 天然互斥）。
+//
+// "常驻"有一个前提，见 g_prep_mu/g_prep_cv 的注释：worker 停驻的那把锁和 cv 必须
+// **永不析构**，否则退出时主线程会在 pthread_cond_destroy 里等一个永远不走的等待者。
 static void prep_worker() {
-    g_prep_worker_running.store(true);
-    while (!g_prep_stop.load()) {
+    for (;;) {
         std::vector<llama_token> ctx;
         int seq = 0;
-        if (!prep_take(ctx, seq)) break;
+        prep_take(ctx, seq);
         for (;;) {
-            if (g_prep_stop.load()) break;
             // 已被更新的请求取代：这是唯一合法的"作废"（旧 ctx 已无人需要）
             if (seq != g_prep_seq.load()) {
                 g_prep_superseded.fetch_add(1);
@@ -1378,7 +1390,6 @@ static void prep_worker() {
             break;
         }
     }
-    g_prep_worker_running.store(false);
 }
 
 static void ensure_prep_worker() {
@@ -1386,22 +1397,9 @@ static void ensure_prep_worker() {
     if (g_prep_worker_started.compare_exchange_strong(expected, true)) {
         // detach 而不是留一个可 join 的 std::thread 全局：那个全局在静态析构期
         // 若仍 joinable，标准库会直接 std::terminate（实测退出时报
-        // "terminate called without an active exception" / abort），而 librime
-        // 的模块 finalize 时机不受我们控制。退出用下面的存活标记手写有界等待。
+        // "terminate called without an active exception" / abort）。
         std::thread(prep_worker).detach();
     }
-}
-
-// 由 llm_module.cc 的 finalize 调用：停 worker 并等它收尾。
-// 为什么需要它：worker 可能正持着 g_mutex 在解码，此时模型被卸载 / 进程收尾
-// 就是 use-after-free——原实现"每次 prepare 起一个 detached 线程"在离线基准的
-// 退出阶段偶发崩溃，正是这一类竞争。
-void rime_llm_shutdown() {
-    g_prep_stop.store(true);
-    g_prep_cv.notify_all();
-    // 有界等待（最长 1s，一次 decode 最多 ~90ms）。不 join，见 ensure_prep_worker。
-    for (int i = 0; i < 500 && g_prep_worker_running.load(); i++)
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
 }
 
 // ============================================================
