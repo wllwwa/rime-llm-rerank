@@ -303,10 +303,14 @@ local function processor(key, env)
                 local okd, ud = pcall(function() return rime_api.get_user_data_dir() end)
                 if okd and ud and ud ~= "" then result.log_dir = ud end
                 llm_prep = result
-                -- 上屏即预习：每个实例连自己的 context（见 connect_commit_hook）
-                connect_commit_hook(env, st)
             end
         end
+        -- 每个实例都要连**自己的** context（connect_commit_hook 内部靠 state 去重）。
+        -- 绝不能放进上面那个"首次 require"块：那里有模块级 llm_prep 守卫，第二个
+        -- 窗口根本进不去，它的 commit 钩子就永远连不上——而这正是本次要修的 bug，
+        -- 真机日志留下过证据（只出现一组"commit 钩子已连接"，第二个窗口的上屏预习
+        -- 全程失效）。
+        if llm_prep then connect_commit_hook(env, st) end
         -- model_path 每键轻量同步（仅变化时写，2026-08-31 修配置不生效的
         -- 根因）：路径只在"一次性 require 块"里读的话，首个触发 require 的
         -- 会话（部署期编译会话/配置未就绪的瞬间）会把默认路径永久固化到
