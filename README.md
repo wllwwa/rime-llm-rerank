@@ -48,7 +48,7 @@
 5. 点击 **复制文件**：停算法服务 → `rime_llm.dll` 等 → 小狼毫安装目录；`llm_filter.lua` / `llm_processor.lua` → `%APPDATA%\Rime\lua\` → 启服务
 6. 点击 **方案配置加 LLM**：schema 幂等插入组件行（`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`、顶层 `llm_rerank:` 节，全键生效行）→ 自动重新部署（**方案配置去 LLM** 按钮为逆操作，剥离这些行/节；重跑加 LLM 保留方案里已有参数与 `model_path`，不会被重置回默认）
 7. 调参数：「参数配置」页改 β / 词长权重 / 编码长度等 → **保存并生效**（自动重新部署）；按钮旁有校验提示，非法输入不落盘
-8. 验证：打满 4 码，首选候选 comment 出现 `AI·` 徽章（`AI·COM` / `AI·UIA` / `AI·历史`，上文来源自动判定）；日志 `%APPDATA%\Rime\rime_llm_events.txt`（未生效时托盘小狼毫 → 右键 → 重新部署）
+8. 验证：打满 4 码，首选候选 comment 出现 `AI·` 徽章（`AI·COM` / `AI·UIA` / `AI·应用` / `AI·历史`，上文来源自动判定）；日志 `%APPDATA%\Rime\rime_llm_events.txt`（未生效时托盘小狼毫 → 右键 → 重新部署）
 
 **切换版本**（插件版 ↔ 源码版）：重装官方小狼毫（恢复官方二进制）→ 源码版跑 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 的安装包 / 插件版跑本仓库安装器（其**方案配置加 LLM** 会先剥离另一版组件行再插入，跨版自动转换，无需恢复原始方案配置）。
 
@@ -96,6 +96,8 @@ Get-Content "$env:APPDATA\Rime\rime_llm_events.txt" -Tail 5
 ```
 
 > WPS 表格单元格编辑态为 COM 盲区（Office 系通病：编辑态对象模型不可见），落 UIA/历史兜底——已知边界。完整实验记录见源码版仓库研究文档（wps-context-investigation.md 十一~二十节，含统一标签页防串档四轮定案）。
+
+> Linux/fcitx5：上文来源由 `fcitx5-rime` 桥接的应用 surrounding text 提供（徽章 `AI·应用`，光标前文取自 `InputContext`，支持前后文/选区/光标偏移），客户端不支持 surrounding text 或处于敏感字段时自动回退 `AI·历史`；桥接为本地原型补丁，方案与验证记录见 `notes/handoffs/fcitx5上下文桥接原型与正式API规划.md`。
 
 ## 配置参数
 

@@ -450,10 +450,12 @@ return function(translation, env)
                 end
             end)
         end
-        -- 来源徽章（与源码版对齐）：com = COM 文档模型（Word/WPS 文字）、
-        -- uia = UIA TextPattern（通用现代应用）、rime = 历史上屏
+        -- 来源徽章：com = COM 文档模型（Word/WPS 文字）、
+        -- uia = UIA TextPattern（通用现代应用）、
+        -- fcitx5 = fcitx5 surrounding text（Linux 桥接）、rime = 历史上屏兜底
         local badge = (ctx_src == "com" and "AI·COM")
                    or (ctx_src == "uia" and "AI·UIA")
+                   or (ctx_src == "fcitx5" and "AI·应用")
                    or "AI·历史"
         for i, c in ipairs(ordered) do
             if i == 1 then

@@ -36,6 +36,9 @@ local function new_state()
         last_full = "",      -- 最后满码（4码），顶屏时回退用
         last_prep_ctx = "",  -- 上次 prepare 的 context，避免重复调用
         commit_conn = nil,   -- 本实例的 commit_notifier 连接（fini 时断开）
+        ctx_obj = nil,       -- 本会话的 Rime Context（读 llm_surrounding property）
+        ctx_raw = nil,       -- 上次读到的 property 原始值（解码缓存键）
+        ctx_info = nil,      -- 解码后的结构化上下文（前文/后文/选区）
     }
 end
 
@@ -66,8 +69,9 @@ local function state_of(env)
     return fallback_state
 end
 
-local com_ctx_enabled = true  -- COM/UIA 光标上文旁路总开关（2026-09-29 定案：
-                              -- 不做配置项、无关闭态；排障直接改此值）
+local env_ctx_enabled = true  -- 外部光标上文旁路总开关（2026-09-29 定案：不做配置项、
+                              -- 无关闭态；排障直接改此值）。Linux 下 fcitx5-rime
+                              -- 桥接的 surrounding text 与 Windows COM/UIA 共用此开关。
 local SPLIT = "|"
 local TAB = "\t"
 local BSP = "←"
@@ -104,6 +108,76 @@ end
 
 local get_context   -- 前置声明（trigger_prepare 要用，定义在文件后半）
 
+-- === fcitx5 surrounding text 桥接解码（2026-10-02，Linux）===
+-- fcitx5-rime 在 process_key() 前把当前 InputContext 的 surrounding text 编码
+-- 写入当前 session 的 llm_surrounding property（单属性、版本化、十六进制），
+-- 编码侧见 fcitx5-rime/src/rimestate.cpp。属性值格式：
+--   "0"                                   桥接可用但上下文无效（客户端不支持/
+--                                         敏感字段/非法偏移）
+--   "1:<provided>:<cursor>:<anchor>:<hex>"  有效；cursor/anchor 为窗口内
+--                                         Unicode 字符偏移（非字节偏移），
+--                                         hex 为窗口内 UTF-8 文本十六进制
+-- 其它形态一律视为不可用 → 回退上屏历史（向前兼容：将来新增版本号不影响旧码）。
+local CTX_PROP = "llm_surrounding"
+
+local function hex_decode(hex)
+    if #hex % 2 ~= 0 or hex:find("[^0-9a-fA-F]") then return nil end
+    return (hex:gsub("%x%x", function(cc) return string.char(tonumber(cc, 16)) end))
+end
+
+-- 按 Unicode 字符数把 text 切成"前 nchars 个字符"和"其余部分"（字节安全）
+local function split_at_char(text, nchars)
+    if nchars <= 0 then return "", text end
+    local pos = utf8.offset(text, nchars + 1)  -- 第 nchars+1 个字符的字节起点
+    if not pos then return text, "" end        -- nchars == #text 时可能是 nil
+    return text:sub(1, pos - 1), text:sub(pos)
+end
+
+-- 解码 property 原始值；返回 nil 表示本键无可用桥接数据
+local function decode_surrounding(raw)
+    if type(raw) ~= "string" or raw == "" then return nil end
+    if raw == "0" then
+        return { valid = false, provided = true }
+    end
+    local provided, cursor_s, anchor_s, hex =
+        raw:match("^1:(%d):(%d+):(%d+):(.*)$")
+    if provided == nil then return nil end
+    local text = hex_decode(hex)
+    if not text then return nil end
+    local n = utf8.len(text)                    -- UTF-8 校验；失败返回 nil
+    local cursor, anchor = tonumber(cursor_s), tonumber(anchor_s)
+    if not n or not cursor or not anchor or cursor > n or anchor > n then
+        return nil
+    end
+    local before, after = split_at_char(text, cursor)
+    local selected = ""
+    if anchor ~= cursor then
+        local lo = math.min(anchor, cursor)
+        local hi = math.max(anchor, cursor)
+        local lo_prefix = split_at_char(text, lo)
+        local hi_prefix = split_at_char(text, hi)
+        selected = hi_prefix:sub(#lo_prefix + 1)
+    end
+    return {
+        valid = true, provided = provided == "1",
+        text = text, cursor = cursor, anchor = anchor,
+        before = before, after = after, selected = selected,
+    }
+end
+
+-- 读取并缓存桥接上下文：桥接侧只在快照变化时改写 property，因此以原始值为
+-- 缓存键，解码结果可跨按键复用（避免每键 hex 解码）。
+local function read_bridge_context(st)
+    local ctx = st and st.ctx_obj
+    if not ctx or not ctx.get_property then return nil end
+    local ok, raw = pcall(function() return ctx:get_property(CTX_PROP) end)
+    if not ok then return nil end
+    if raw == st.ctx_raw then return st.ctx_info end
+    st.ctx_raw = raw
+    st.ctx_info = decode_surrounding(raw)
+    return st.ctx_info
+end
+
 local function reset_history(st)
     st.history = {}
     st.prev_hist = {}
@@ -132,8 +206,9 @@ end
 -- 不一致会导致 prep 永远不命中 → 每次 score 完整解码 (~50ms)。
 -- 中文无空白两者相同; 含英文/空格 (如 "Hello world 你好") 时保证一致。
 local function trigger_prepare(st)
+    if not (llm_prep and llm_prep.prepare) then return end
     local cur_ctx = (get_context(st) or ""):gsub('%s+', '')
-    if llm_prep and llm_prep.prepare and cur_ctx ~= st.last_prep_ctx then
+    if cur_ctx ~= st.last_prep_ctx then
         st.last_prep_ctx = cur_ctx
         llm_prep.prepare(cur_ctx)
     end
@@ -280,6 +355,8 @@ local function processor(key, env)
     -- 供 llm_filter 经 _G.llm_context_get 兜底读取（见文件末说明）
     local st = state_of(env)
     last_state = st
+    -- 缓存本会话 Context（读 llm_surrounding property 用；每实例一份）
+    if not st.ctx_obj then st.ctx_obj = env.engine.context end
 
     -- 上文检查 + 预解码 (每次按键): commit_history 变化 → 立即异步预解码
     local sc = env.engine.schema.config
@@ -520,15 +597,27 @@ local function processor(key, env)
 end
 
 get_context = function(st)
-    -- 三层上文（2026-09-10 全功能）：COM（Word/WPS 文字文档模型）→
-    -- UIA TextPattern（通用现代应用）→ 上屏历史（兜底）。前两层由 DLL
-    -- llm_context() 完成（前台门控 + 快照新鲜度 + 来源进程校验都在 C++，
-    -- 按键路径零阻塞）；失败回落历史。旁路无常关配置（2026-09-29 定案删
-    -- com_context 配置项；排障改文件头 com_ctx_enabled 重部署）
-    if com_ctx_enabled and llm_prep and llm_prep.llm_context then
+    -- 三层上文（2026-09-10 全功能；2026-10-02 补 Linux 桥接层）：COM（Word/WPS
+    -- 文字文档模型）→ UIA TextPattern（通用现代应用）→ fcitx5 surrounding text
+    -- （Linux，fcitx5-rime 桥接的 llm_surrounding property）→ 上屏历史（兜底）。
+    -- 前两层由 DLL llm_context() 完成（前台门控 + 快照新鲜度 + 来源进程校验都在
+    -- C++，按键路径零阻塞）；桥接层只读本会话 property（同步、无 IPC）；
+    -- 都拿不到才回退历史。旁路无常关配置（2026-09-29 定案删 com_context
+    -- 配置项；排障改文件头 env_ctx_enabled 重部署）
+    if env_ctx_enabled and llm_prep and llm_prep.llm_context then
         local ok, t, src = pcall(llm_prep.llm_context)
         if ok and type(t) == "string" and #t > 0 then
             return t, src
+        end
+    end
+    if env_ctx_enabled then
+        local info = read_bridge_context(st)
+        -- 必须"有效且含非空白字符"才算应用上文：文本编辑器空行等场景下，应用
+        -- 上报的 surrounding text 可能只有换行/空格（before="\n"），此时实际
+        -- 上文为空；若判为 fcitx5 会出现"没有上文却显示 AI·应用"的徽章。
+        -- 与其它无效情况一致，回退上屏历史（徽章 AI·历史）。
+        if info and info.valid and info.before:find("%S") then
+            return info.before, "fcitx5"
         end
     end
     return table.concat(st.history, ""), "rime"
@@ -544,6 +633,14 @@ end
 _G.llm_context_get = function()
     if last_state then return get_context(last_state) end
     return "", "rime"
+end
+
+-- 结构化上下文出口（前文/后文/选区/光标/是否由客户端提供）：当前 filter 只用
+-- 前文参与评分，完整字段留给后续编辑类能力（如选区替换）。注意只有 fcitx5
+-- 桥接层提供结构化字段；Windows COM/UIA 与历史回退只有整段文本。
+_G.llm_context_info = function()
+    if last_state then return read_bridge_context(last_state) end
+    return nil
 end
 
 -- 组件析构时调用（librime-lua 在 LuaProcessor::~LuaProcessor 里调 fini(env)）：
