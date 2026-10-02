@@ -18,9 +18,14 @@ local cfg = {
     max_tokens       = 10,  -- 截取的上文 token 数（与 C++ 默认/源码版/README 统一，2026-09-02）
     max_candidates   = 5,
     cpu_cores        = nil,  -- nil = 不设置，走 C++ 默认（固定 4，bench_threads 实测后可配）
+    n_gpu_layers     = nil,  -- nil = 走 C++ 默认（-1：有 GPU 时全部层进显存）；0 = 纯 CPU
     debug_fusion     = false, -- true = 逐候选融合明细写 rime_llm_debug.txt (诊断用)
     expected_length_weight = 0.2,  -- 预期词长加成 (冷启动标定 2026-09-03; 0=关闭)
     freq_beta = 1.5,  -- 对数词频融合系数 (0=关闭); fused = score + β·log(1+eff)
+    -- 日志总开关（schema: llm_rerank/log_enabled，缺省 true = 与加开关前一致）：
+    -- false 时本文件不再写 rime_llm_events.txt，且经 cpp.log_enabled 把同一
+    -- 开关传给 C++（rime_llm_log.txt 的 prepare/score/探测明细一并静默）。
+    log_enabled      = true,
 }
 
 local lat_max   = 0
@@ -127,9 +132,15 @@ local function load_llm(env)
         cpp.max_ctx    = cfg.max_tokens
         -- min_tokens 不设置：固定用 C++ 默认 1（用户配置面已移除，2026-09-30）
         if cfg.cpu_cores then cpp.n_threads = cfg.cpu_cores end
+        -- GPU offload 层数（2026-10-02）：-1 全 offload / 0 纯 CPU；
+        -- 变更即卸载重载（C++ 侧 n_gpu_layers 的 setter 语义）
+        if cfg.n_gpu_layers then cpp.n_gpu_layers = cfg.n_gpu_layers end
         -- 日志目录: RIME 用户目录 (未设置时 C++ 回退 %TEMP%)
         local okd, ud = pcall(function() return rime_api.get_user_data_dir() end)
         if okd and ud and ud ~= "" then cpp.log_dir = ud end
+        -- 日志总开关转发给 C++（与 log_dir 同路）：false 时 rime_llm_log.txt
+        -- 的 prepare/score/探测明细全部静默
+        cpp.log_enabled = cfg.log_enabled and true or false
         llm = cpp
         llm_loaded_for = true
     end
@@ -151,9 +162,15 @@ local function init_config(env)
     if v then cfg.max_candidates = v end
     v = sc:get_int("llm_rerank/cpu_cores")
     if v then cfg.cpu_cores = v end
+    v = sc:get_int("llm_rerank/n_gpu_layers")
+    if v then cfg.n_gpu_layers = v end
     -- min_tokens 不再从 schema 读取（2026-09-30 用户配置面移除；固定 C++ 默认 1）
     local dbg = sc:get_bool("llm_rerank/debug_fusion")
     if dbg ~= nil then cfg.debug_fusion = dbg end
+    -- 日志总开关（缺省 true；与 max_tokens 一样只在首次初始化时读取，
+    -- 改配置后需重新部署才生效）
+    local logv = sc:get_bool("llm_rerank/log_enabled")
+    if logv ~= nil then cfg.log_enabled = logv end
 end
 
 -- === Filter ===
@@ -161,6 +178,10 @@ return function(translation, env)
     -- 每次调用都从 schema 读取 enabled，确保重新部署后立即生效
     local sc = env.engine.schema.config
     local enabled = sc:get_bool("llm_rerank/enabled") or false
+    -- 日志总开关同样每次读取（缺省 true = 与加开关前一致）：改配置后只要
+    -- 重新部署即可生效，不必重启 fcitx5；下面还会把同一个值转给 C++。
+    local logv = sc:get_bool("llm_rerank/log_enabled")
+    local log_on = (logv == nil) and true or logv
 
     -- Init config once (non-DLL config doesn't invalidate on redeploy)
     if not cfg._inited then
@@ -198,6 +219,10 @@ return function(translation, env)
     if not llm then
         for _, c in ipairs(all) do yield(c) end; return
     end
+
+    -- 每键把日志开关同步给 C++（rime_llm_log.txt 的 log_msg 用）：改配置
+    -- 重新部署后 C++ 侧即刻静默，同样不必重启 fcitx5
+    llm.log_enabled = log_on
 
     -- 触发条件：编码串是否匹配 code_pattern（2026-09-30 取代 min/max_code_len 区间）
     -- 全串匹配（同 Rime auto_select_pattern 语义）。优先用 DLL 的 std::regex
@@ -247,7 +272,8 @@ return function(translation, env)
             log_dir = os.getenv("TMPDIR") or "/tmp"
         end
         local epath = log_dir .. "/rime_llm_events.txt"
-        local ef = io.open(epath, "a")
+        -- 总开关（llm_rerank/log_enabled）：关掉时连文件都不打开（轮转/写入随之跳过）
+        local ef = log_on and io.open(epath, "a") or nil
         -- 日志轮转 (2026-09-04): >5MB 改名 .old (单文件轮转), 防无限增长
         if ef then
             local esz = ef:seek("end")
@@ -278,7 +304,8 @@ return function(translation, env)
 
     -- 融合诊断 (llm_rerank/debug_fusion: true): 每次评分逐候选记录
     -- CE/eff/词频加成/词长加成/最终 key 与名次, 写 rime_llm_debug.txt
-    local dbg = cfg.debug_fusion and {} or nil
+    -- debug 明细也受总开关约束（关日志时不再写 rime_llm_debug.txt）
+    local dbg = (cfg.debug_fusion and log_on) and {} or nil
     local dbg_span = nil
     if dbg then
         local ctx_tail = #context > 16 and ("…" .. context:sub(-15)) or context

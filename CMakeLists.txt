@@ -67,6 +67,27 @@ add_library(ggml_cpu_ext STATIC IMPORTED GLOBAL)
 set_target_properties(ggml_cpu_ext PROPERTIES
   IMPORTED_LOCATION "${LLAMA_ROOT}/build/ggml/src/libggml-cpu.a")
 
+# GPU（Vulkan）后端（2026-10-02）：llama.cpp 以 -DGGML_VULKAN=ON 构建时自动
+# 链接；未构建则纯 CPU（行为不变）。收益与开关证据见
+# notes/tests/LLM重排GPU后端门槛测试报告.md（prefill 5.5x / score 3.3-4.0x）。
+# 注：静态链接时 ggml.a 对 ggml_backend_vk_reg 是未解析引用，vulkan 库须排其后。
+set(_vk_lib "${LLAMA_ROOT}/build/ggml/src/ggml-vulkan/libggml-vulkan.a")
+set(_vk_deps "")
+if(EXISTS "${_vk_lib}")
+  find_package(Vulkan QUIET)
+  if(Vulkan_FOUND)
+    add_library(ggml_vulkan_ext STATIC IMPORTED GLOBAL)
+    set_target_properties(ggml_vulkan_ext PROPERTIES
+      IMPORTED_LOCATION "${_vk_lib}")
+    set(_vk_deps ggml_vulkan_ext ${Vulkan_LIBRARY})
+    message(STATUS "rime-llm: Vulkan 后端已启用（${_vk_lib}）")
+  else()
+    message(STATUS "rime-llm: 有 libggml-vulkan.a 但缺 Vulkan 开发库，按纯 CPU 构建")
+  endif()
+else()
+  message(STATUS "rime-llm: 未找到 libggml-vulkan.a，按纯 CPU 构建")
+endif()
+
 set(plugin_name rime-llm PARENT_SCOPE)
 set(plugin_objs $<TARGET_OBJECTS:rime-llm-objs> PARENT_SCOPE)
 set(plugin_deps
@@ -74,6 +95,7 @@ set(plugin_deps
   ggml_ext
   ggml_base_ext
   ggml_cpu_ext
+  ${_vk_deps}
   Threads::Threads
   ${OpenMP_CXX_LIBRARIES}
   ${rime_library}

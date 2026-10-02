@@ -78,6 +78,10 @@ static int          g_n_ctx           = 128; // KV: 11 seqs × (ctx 10 + cand 2)
                                               //  64 时 score 的 S2 恒 ~100ms vs 128 的 ~40ms，
                                               //  真机 DLL 日志实证）
 static int          g_n_seq_max       = 12;  // 模板 seq 0 + 最多 11 worker seq
+// GPU offload 层数（2026-10-02，见 notes/tests/LLM重排GPU后端门槛测试报告.md）：
+// -1 = 有可用 GPU 时全部层进显存（llama.cpp 默认）；0 = 纯 CPU；N = 前 N 层。
+// 只在模型加载时生效，改动走 unload/reload（同 n_threads）。
+static int          g_n_gpu_layers    = -1;
 
 // CE 位置权重（2026-09-16 采纳，首项归一规范形；与 (1.15,1.30,0.70) 排序等价、
 // ce2 判别力最强（同时携带上下文契合 + 词内连贯），ce3 已深入词内部、上下文
@@ -142,6 +146,13 @@ static std::atomic<int>         g_prep_superseded{0}; // 被更新取代的请�
 // 目录: Lua 侧设置 log_dir (RIME 用户目录); 未设置则回退 %TEMP%
 // ============================================================
 static std::string g_log_dir;
+// 日志总开关（2026-10-02）：配置面是 schema 的 llm_rerank/log_enabled，
+// 由 lua 经 cpp.log_enabled 传进来（与 log_dir 同路，见 lua_newindex）。
+// 默认 true = 与加开关前的行为完全一致；置 false 后所有 log_msg
+// （prepare/score/上下文探测等）直接返回，连 fopen 都不做。
+// lua 侧那份 rime_llm_events.txt / plog 行由同一个配置项在 lua 自己的
+// 判断里关掉（见 llm_filter.lua / llm_processor.lua）。
+static std::atomic<bool> g_log_enabled{true};
 
 // 本地时间戳 "HH:MM:SS.mmm"（2026-10-01 加：原日志无时间，
 // 无法与 events 文件对齐，也无法还原 prepare/score 的先后时序）
@@ -163,6 +174,8 @@ static void now_stamp(char * out, size_t n) {
 }
 
 static void log_msg(const char * fmt, ...) {
+    // 总开关：关掉后连 vsnprintf/fopen 都不做（llm_rerank/log_enabled）
+    if (!g_log_enabled.load(std::memory_order_relaxed)) return;
     char buf[512];
     va_list ap;
     va_start(ap, fmt);
@@ -888,6 +901,18 @@ inline unsigned long foreground_pid() { return 0; }
 // ============================================================
 // 异步模型加载
 // ============================================================
+// Vulkan 显存策略（2026-10-02，本机 7800 XT 实测）：强制权重进 device-local
+// 显存，避开 host-visible（pinned host 内存，RADV+ReBAR 下的默认优选）的
+// PCIe 带宽瓶颈——中载 Step2 29ms → 16ms（门槛测试报告 §4.2）。
+// 必须在设备初始化（llama_backend_init / 首次模型加载）前设置；
+// 外部环境已显式设置时不覆盖（留出用户覆盖口）。
+static void apply_vulkan_defaults() {
+#ifndef _WIN32
+    if (!getenv("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM"))
+        setenv("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM", "1", 1);
+#endif
+}
+
 static void load_model_async() {
     if (g_loaded.load() || g_loading.load()) return;
     g_loading.store(true);
@@ -902,9 +927,11 @@ static void load_model_async() {
 #endif
         log_msg("loading model: %s", g_model_path.c_str());
 
+        apply_vulkan_defaults();  // 必须在 backend/设备初始化之前
         llama_backend_init();
 
         llama_model_params mparams = llama_model_default_params();
+        mparams.n_gpu_layers = g_n_gpu_layers;
 #ifdef _WIN32
         mparams.use_mmap = 1;
 #else
@@ -962,7 +989,8 @@ static void load_model_async() {
 
         g_loaded.store(true);
         g_loading.store(false);
-        log_msg("model ready (n_ctx=%d threads=%d)", g_n_ctx, n_thr);
+        log_msg("model ready (n_ctx=%d threads=%d n_gpu_layers=%d)", g_n_ctx,
+                n_thr, g_n_gpu_layers);
     }).detach();
 }
 
@@ -1678,6 +1706,7 @@ static int lua_index(lua_State * L) {
     else if (strcmp(key, "n_threads") == 0) lua_pushinteger(L, g_n_threads);
     else if (strcmp(key, "n_ctx") == 0)     lua_pushinteger(L, g_n_ctx);
     else if (strcmp(key, "n_seq_max") == 0) lua_pushinteger(L, g_n_seq_max);
+    else if (strcmp(key, "n_gpu_layers") == 0) lua_pushinteger(L, g_n_gpu_layers);
     else lua_pushnil(L);
     return 1;
 }
@@ -1716,7 +1745,18 @@ static int lua_newindex(lua_State * L) {
         }
     }
     else if (strcmp(key, "n_seq_max") == 0)  g_n_seq_max = (int)luaL_checkinteger(L, 3);
+    // GPU offload 层数（schema: llm_rerank/n_gpu_layers）：-1 全 offload / 0 纯 CPU。
+    // 只在模型加载时生效（同 n_threads），变更即卸载重载。
+    else if (strcmp(key, "n_gpu_layers") == 0) {
+        int v = (int)luaL_checkinteger(L, 3);
+        if (v != g_n_gpu_layers) {
+            g_n_gpu_layers = v;
+            if (g_loaded.load()) unload_model();
+        }
+    }
     else if (strcmp(key, "log_dir") == 0)    g_log_dir = luaL_checkstring(L, 3);  // RIME 用户目录
+    // 日志总开关（schema: llm_rerank/log_enabled，lua 侧初始化配置时传入）
+    else if (strcmp(key, "log_enabled") == 0) g_log_enabled.store(lua_toboolean(L, 3) != 0);
     return 0;
 }
 

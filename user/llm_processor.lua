@@ -15,7 +15,13 @@
 -- 格式刻意**不带毫秒**（分析脚本只认 "HH:MM:SS.mmm" 开头的行），所以这些行
 -- 不会被算进 prepare/score 的统计，只是给人看的路标。多窗口验证就靠这些行：
 -- 两个窗口各应出现一组"实例状态已建立 / commit 钩子已连接"。
+-- 日志总开关（llm_rerank/log_enabled，processor 每次按键刷新；缺省 true）。
+-- 关掉后 plog 与本文件内的其它日志写入一律跳过（C++ 侧的 rime_llm_log.txt
+-- 明细由 llm_filter 经 cpp.log_enabled 传递同一个值后一并关闭）。
+local log_enabled = true
+
 local function plog(msg)
+    if not log_enabled then return end
     local ok, ud = pcall(function() return rime_api.get_user_data_dir() end)
     if not ok or not ud or ud == "" then return end
     local f = io.open(ud .. "/rime_llm_log.txt", "a")
@@ -59,7 +65,9 @@ local function state_of(env)
     end
     if not fallback_state then
         fallback_state = cand
-        local f = io.open(rime_api.get_user_data_dir() .. "/rime_llm_log.txt", "a")
+        local f = log_enabled
+            and io.open(rime_api.get_user_data_dir() .. "/rime_llm_log.txt", "a")
+            or nil
         if f then
             f:write(string.format("%s prepare: WARN env 不可写，组件状态退回全局共享\n",
                                   os.date("%H:%M:%S")))
@@ -351,6 +359,11 @@ end
 
 local function processor(key, env)
     if key:release() then return 2 end
+    local sc = env.engine.schema.config
+    -- 日志总开关（每次按键刷新，重新部署后即生效；缺省 true = 与加开关前一致）。
+    -- 必须在 state_of 之前读：组件实例首次建立时的 plog 用的就是本次的值。
+    local logv = sc:get_bool("llm_rerank/log_enabled")
+    log_enabled = (logv == nil) and true or logv
     -- 本实例状态（每个 session 一份）；同时记为"最近一次调用的状态"，
     -- 供 llm_filter 经 _G.llm_context_get 兜底读取（见文件末说明）
     local st = state_of(env)
@@ -359,7 +372,6 @@ local function processor(key, env)
     if not st.ctx_obj then st.ctx_obj = env.engine.context end
 
     -- 上文检查 + 预解码 (每次按键): commit_history 变化 → 立即异步预解码
-    local sc = env.engine.schema.config
     local enabled = sc:get_bool("llm_rerank/enabled") or false
     if not enabled then
         llm_prep = nil  -- 释放已加载的 DLL 引用
