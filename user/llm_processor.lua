@@ -428,6 +428,15 @@ local function processor(key, env)
             llm_prep.max_ctx = mtk
             _G.llm_filter_cache = nil
         end
+        -- GPU offload 层数同理（2026-10-02）：C++ 默认 -1（有 GPU 时全 offload），
+        -- 配置写 0 表示纯 CPU。必须在**首次 prepare 触发加载之前**写入，否则模型
+        -- 会先按 -1 加载进显存、配置形同虚设（真机踩坑：加 n_gpu_layers: 0 重新
+        -- 部署后日志仍是 n_gpu_layers=-1）。取值可为 -1/0/正整数，故只判 nil。
+        local ng = sc:get_int("llm_rerank/n_gpu_layers")
+        if ng ~= nil and llm_prep and llm_prep.n_gpu_layers ~= ng then
+            llm_prep.n_gpu_layers = ng
+            _G.llm_filter_cache = nil
+        end
     end
     -- 鼠标点击检测（2026-09-11 深夜用户定案：任何点击=光标可能移动→
     -- 清历史上文兜底，不做例外排除——候选窗/工具栏点击也清，上下文

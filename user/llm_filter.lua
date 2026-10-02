@@ -224,6 +224,12 @@ return function(translation, env)
     -- 重新部署后 C++ 侧即刻静默，同样不必重启 fcitx5
     llm.log_enabled = log_on
 
+    -- GPU offload 层数同样每键读（2026-10-02）：只放在 init_config 里读过一次的话，
+    -- 配置改动不会被已有会话读到（真机踩坑：加了 n_gpu_layers: 0 重新部署后仍走
+    -- GPU）。C++ 侧 setter 是"值变才卸载重载"，所以每键写不会反复重载。
+    local ng = sc:get_int("llm_rerank/n_gpu_layers")
+    if ng ~= nil then llm.n_gpu_layers = ng end
+
     -- 触发条件：编码串是否匹配 code_pattern（2026-09-30 取代 min/max_code_len 区间）
     -- 全串匹配（同 Rime auto_select_pattern 语义）。优先用 DLL 的 std::regex
     -- （与源码版 boost::regex 同一套 ECMAScript 语法）；DLL 不提供该函数时
