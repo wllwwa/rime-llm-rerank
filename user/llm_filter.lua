@@ -293,6 +293,21 @@ return function(translation, env)
         if ef then
             local cand_str = table.concat(cands, ","):gsub("|", "/")
             local ctx_safe = context:gsub("|", "/"):gsub("\n", " ")
+            -- 日志 ctx 截短（2026-10-02，跟 max_tokens 走）：评分实际只用末尾
+            -- max_tokens 个 token（C++ ctx_token_ids 再截），整段前文会把单行日志
+            -- 撑到 2KB+（fcitx5 桥接窗口上限 768 字符）。这里只截**日志字段**，
+            -- 送入 llm.score() 的 context 不受影响。截短行以 "…" 开头标记；
+            -- 长度 = max(max_tokens×4 字符, 40)——4 字符/token 覆盖英文上文，
+            -- 下限 40 保证 extract_from_events.py 的位移解析有足够重叠。
+            -- 工具侧已按截短口径升级（tools/llm_bench/extract_from_events.py）。
+            do
+                local keep = math.max((cfg.max_tokens or 10) * 4, 40)
+                local total = utf8.len(ctx_safe)
+                if total and total > keep then
+                    ctx_safe = "…" ..
+                        ctx_safe:sub(utf8.offset(ctx_safe, total - keep + 1))
+                end
+            end
             local res_info = "nil"
             if ok and type(result) == "table" then
                 res_info = table.concat(result, ","):gsub("|", "/")
