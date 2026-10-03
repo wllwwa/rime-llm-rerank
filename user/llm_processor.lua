@@ -633,12 +633,36 @@ get_context = function(st)
     end
     if env_ctx_enabled then
         local info = read_bridge_context(st)
-        -- 必须"有效且含非空白字符"才算应用上文：文本编辑器空行等场景下，应用
+        -- 必须"有效且含非空白字符"才算应用上文：应用
         -- 上报的 surrounding text 可能只有换行/空格（before="\n"），此时实际
         -- 上文为空；若判为 fcitx5 会出现"没有上文却显示 AI·应用"的徽章。
         -- 与其它无效情况一致，回退上屏历史（徽章 AI·历史）。
         if info and info.valid and info.before:find("%S") then
-            return info.before, "fcitx5"
+            local before = info.before
+            -- 快照补尾（2026-10-03，"无休止"止排第4实锤）：顶屏在下一个和弦
+            -- burst 的第一个注入键上才提交上一组合（同一物理按键事件内），
+            -- 而桥接 property 在事件前写入——刚上屏的词结构上进不了桥接
+            -- 快照；桥接一旦有效又会遮蔽永远新鲜的 commit 历史兜底
+            -- （get_context 末行），连续打字时评分上下文恒缺最后一个词。
+            -- 用本会话提交词（st.history；点击/编辑键/切应用已重置，不会
+            -- 冒充旧词）校验：找最大的 k 使 history[1..k] 连接串是 before
+            -- 的后缀，缺的尾部直接补上。应用文本与会话历史完全对不上
+            -- （应用侧自行改文）时补尾可能失真，但旧行为在该场景同样失真
+            -- （缺词），且重置兜底覆盖了绝大多数位置变化。
+            local n = #st.history
+            if n > 0 then
+                local k, head = 0, ""
+                for i = 1, n do
+                    head = head .. st.history[i]
+                    if #head <= #before and before:sub(-#head) == head then
+                        k = i
+                    end
+                end
+                if k < n then
+                    before = before .. table.concat(st.history, "", k + 1, n)
+                end
+            end
+            return before, "fcitx5"
         end
     end
     return table.concat(st.history, ""), "rime"
